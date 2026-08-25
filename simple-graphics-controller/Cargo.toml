@@ -1,0 +1,11 @@
+[package]
+name = "simple-graphics-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+simple-graphics-protocol = { path = "../simple-graphics-protocol" }
+tokio = { version = "1", features = ["full"] }
+nix = { version = "0.29", features = ["fs", "socket", "uio"] }
+sendfd = { version = "0.4.4", features = ["tokio"] }
+dashmap = "6.2.1"

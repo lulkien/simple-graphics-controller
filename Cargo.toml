@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "simple-graphics-controller",
+    "simple-graphics-protocol",
+    "sgc-fbdev-client",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+

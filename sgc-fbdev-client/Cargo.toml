@@ -1,0 +1,11 @@
+[package]
+name = "sgc-fbdev-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+simple-graphics-protocol = { path = "../simple-graphics-protocol" }
+nix = { version = "0.29", features = ["socket"] }
+sendfd = { version = "0.4.4", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+
