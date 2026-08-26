@@ -3,6 +3,5 @@
 pub mod message;
 pub mod serialization;
 
-pub use message::{Request, Resource, Response};
+pub use message::{ClientRequest, Resource, ServerMessage};
 pub use serialization::{ProtocolError, deserialize, serialize};
-

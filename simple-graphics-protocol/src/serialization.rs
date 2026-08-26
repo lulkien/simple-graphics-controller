@@ -1,6 +1,7 @@
-use crate::message::{Request, Response};
 use rmp_serde::{decode, encode};
 use thiserror::Error;
+
+use crate::{ClientRequest, ServerMessage};
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -23,5 +24,5 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, Pro
 }
 
 // Type aliases used by callers to keep signatures readable.
-pub type WireRequest = Request;
-pub type WireResponse = Response;
+pub type WireRequest = ClientRequest;
+pub type WireResponse = ServerMessage;
