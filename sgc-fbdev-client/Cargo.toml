@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 simple-graphics-protocol = { path = "../simple-graphics-protocol" }
-nix = { version = "0.29", features = ["socket"] }
+nix = { version = "0.29", features = ["socket", "ioctl"] }
 sendfd = { version = "0.4.4", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+socket2 = "0.5"
 

@@ -5,6 +5,7 @@ use std::{
 
 use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
+use tracing::{error, info};
 
 use crate::types::{OwnerRegistry, ResourceRegistry};
 
@@ -14,7 +15,6 @@ pub fn query_resource() -> (ResourceRegistry, OwnerRegistry) {
 
     open_fbdev(resource_reg.clone(), owner_reg.clone());
     open_drm_devices(resource_reg.clone(), owner_reg.clone());
-    open_input_devices(resource_reg.clone(), owner_reg.clone());
 
     (resource_reg, owner_reg)
 }
@@ -24,18 +24,20 @@ fn open_fbdev(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
         Ok(file) => {
             resource_reg.insert(Resource::Fbdev, file.into());
             owner_reg.insert(Resource::Fbdev, None);
+            info!("Opened /dev/fb0");
         }
         Err(e) => {
-            eprintln!("Failed to open /dev/fb0: {e}");
+            error!("Failed to open /dev/fb0: {e}");
         }
     }
 }
 
+#[allow(unused)]
 fn open_drm_devices(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
     let entries = match read_dir("/dev/dri/") {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("Faield to read /dev/dri: {e}");
+            error!("Failed to read /dev/dri: {e}");
             return;
         }
     };
@@ -53,8 +55,5 @@ fn open_drm_devices(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
         .collect::<Vec<_>>();
 
     paths.sort();
-}
-
-fn open_input_devices(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
-    todo!()
+    info!("Found DRM devices: {:?}", paths);
 }
