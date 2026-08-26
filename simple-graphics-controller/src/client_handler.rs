@@ -42,7 +42,7 @@ pub async fn handle_connection(
 
         match stream.read(&mut buf).await {
             Ok(0) => {
-                debug!("EOF");
+                debug!("Client disconnected");
                 break;
             }
 

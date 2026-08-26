@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use linfb::Framebuffer;
 use sendfd::RecvWithFd;
 use simple_graphics_protocol::{ClientRequest, Resource, ServerMessage, deserialize, serialize};
 use tokio::{
@@ -86,6 +87,14 @@ async fn main() {
             Err(e) => panic!("recv failed: {e}"),
         }
     }
+
+    let _framebuffer = Framebuffer::open_with_fd(
+        resources_map
+            .get(&Resource::Fbdev)
+            .expect("get fbdev failed").unwrap(),
+    )
+    .expect("framebuffer open failed");
+
 
     release_resource(&mut stream, &mut resources_map).await;
 }
