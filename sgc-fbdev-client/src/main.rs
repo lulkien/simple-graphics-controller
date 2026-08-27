@@ -8,7 +8,10 @@ use std::{
     },
 };
 
-use linfb::Framebuffer;
+use linfb::{
+    Framebuffer,
+    shape::{Alignment, Caption, Color, FontBuilder, Rectangle, Shape},
+};
 use sendfd::RecvWithFd;
 use simple_graphics_protocol::{ClientRequest, Resource, ServerMessage, deserialize, serialize};
 use tokio::{
@@ -88,13 +91,55 @@ async fn main() {
         }
     }
 
-    let _framebuffer = Framebuffer::open_with_fd(
+    let mut framebuffer = Framebuffer::open_with_fd(
         resources_map
             .get(&Resource::Fbdev)
-            .expect("get fbdev failed").unwrap(),
+            .expect("get fbdev failed")
+            .unwrap(),
     )
     .expect("framebuffer open failed");
 
+    let mut compositor = framebuffer.compositor((255, 255, 255).into());
+
+    compositor
+        .add(
+            "rect1",
+            Rectangle::builder()
+                .width(100)
+                .height(100)
+                .fill_color(Color::hex("#ff000099").unwrap())
+                .build()
+                .unwrap()
+                .at(100, 100),
+        )
+        .add(
+            "rect2",
+            Rectangle::builder()
+                .width(100)
+                .height(100)
+                .fill_color(Color::hex("#00ff0099").unwrap())
+                .build()
+                .unwrap()
+                .at(150, 150),
+        )
+        // .add("image", Image::from_path("image.png").unwrap().at(500, 500))
+        .add(
+            "wrapped_text",
+            Caption::builder()
+                .text("Some centered text\nwith newlines".into())
+                .size(56)
+                .color(Color::hex("#4066b877").unwrap())
+                .font(FontBuilder::default().family("monospace").build().unwrap())
+                .alignment(Alignment::Center)
+                .max_width(650)
+                .build()
+                .unwrap()
+                .at(1000, 300),
+        );
+    // Compositor is shape, so we can just draw it at the top left angle
+    framebuffer.draw(0, 0, &compositor);
+    // Really changing screen contents
+    framebuffer.flush();
 
     release_resource(&mut stream, &mut resources_map).await;
 }
