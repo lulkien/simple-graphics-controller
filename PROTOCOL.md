@@ -33,7 +33,11 @@ client                          server
   |                                |
   |              Grant             |   {resources}  + fds (SCM_RIGHTS)
   |<-------------------------------|
-  |        (or Deny {reason})      |
+  |                                |
+  |               Ack              |   (client confirms receipt of Grant+fds)
+  |------------------------------->|
+  |                                |
+  |            (or Deny {reason})   |
   |                                |
   |       Release {resources}      |
   |------------------------------->|
@@ -46,6 +50,12 @@ On connect the server immediately sends `Advertise` (no hello handshake).
 `Acquire` is **atomic**: if any requested resource is not free — owned by
 another client, or already owned by the requesting client — the server denies
 the *entire* request with `Deny {reason}` and grants nothing.
+
+After sending `Grant`, the server waits up to **5 seconds** for the client to
+reply with `Ack` (sent only after the client successfully received the grant
+and its fds). If no `Ack` arrives in time — or the client sends something else
+first — the server logs a warning that the grant is unconfirmed. The resource
+stays owned by the client either way; `Ack` is a delivery signal, not a lease.
 
 ## Messages
 
@@ -64,6 +74,7 @@ one-entry maps `{field: value}`.
 | -------- | ---------------------------- | ------------------ |
 | Acquire  | `resources: [Resource]`      | `81 a7 41 63 71 75 69 72 65 81 a9 72 65 73 6f 75 72 63 65 73 91 a5 46 62 64 65 76` |
 | Release  | `resources: [Resource]`      | `81 a7 52 65 6c 65 61 73 65 81 a9 72 65 73 6f 75 72 63 65 73 91 a5 46 62 64 65 76` |
+| Ack      | —                            | `a3 41 63 6b`      |
 
 `Acquire {resources: [Fbdev]}` decoded: `{"Acquire": {"resources": ["Fbdev"]}}`.
 

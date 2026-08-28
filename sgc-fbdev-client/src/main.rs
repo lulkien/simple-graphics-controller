@@ -117,6 +117,11 @@ async fn main() {
             for (idx, resource) in resources.into_iter().enumerate() {
                 resources_map.insert(resource, Some(fds[idx]));
             }
+
+            // Acknowledge the grant so the server knows it landed.
+            let ack = serialize_framed(&ClientRequest::Ack).expect("serialize ack failed");
+            stream.write_all(&ack).await.expect("write ack failed");
+            println!("Sent Ack");
         }
         ServerMessage::Deny { reason } => {
             println!("Denied: {reason}");

@@ -27,6 +27,11 @@ pub enum ClientRequest {
         /// The resources the client wants to release.
         resources: Vec<Resource>,
     },
+    /// Acknowledges receipt of a [`ServerMessage::Grant`] and its file
+    /// descriptors. The server waits for this within a timeout after
+    /// granting; without it the server cannot tell a delivered grant from a
+    /// lost one.
+    Ack,
 }
 
 /// A message sent from the server to a client.

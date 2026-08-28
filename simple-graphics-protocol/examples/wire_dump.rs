@@ -19,6 +19,10 @@ fn main() {
             .unwrap(),
         ),
         (
+            "Ack".into(),
+            serialize(&ClientRequest::Ack).unwrap(),
+        ),
+        (
             "Advertise{[Fbdev]}".into(),
             serialize(&ServerMessage::Advertise {
                 available_resources: vec![Resource::Fbdev],
