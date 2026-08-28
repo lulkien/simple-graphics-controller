@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::error::{ServerError, ServerResult};
+use crate::types::lock_owners;
 use anyhow::Context;
 use nix::libc::pid_t;
 use sendfd::SendWithFd;
@@ -100,76 +101,89 @@ async fn handle_client_request(
     owner_reg: OwnerRegistry,
     resource_reg: ResourceRegistry,
 ) -> ServerResult<()> {
-    // Atomic acquire: if any requested resource is not free, deny the whole
-    // request and grant nothing.
-    for resource in &resources {
-        let owner = *owner_reg
-            .get(resource)
-            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} has no owner entry"))?;
-        let reason = match owner {
-            Some(o) if o == pid => Some(format!("{resource:?} is already owned by this client")),
-            Some(o) => Some(format!("{resource:?} is owned by pid {o}")),
-            None => None,
-        };
-        if let Some(reason) = reason {
+    // Atomic acquire: validate and claim under a single lock so concurrent
+    // requests cannot both pass the "free" check (TOCTOU). The lock is held
+    // only for the check+claim (no awaits inside).
+    let mut grant_fds: Vec<RawFd> = Vec::new();
+    let reason = {
+        let mut owners = lock_owners(&owner_reg);
+
+        // Validate: all requested resources must be registered and free.
+        let mut reason = None;
+        for resource in &resources {
+            resource_reg
+                .get(resource)
+                .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?;
+            match owners.get(resource) {
+                Some(Some(o)) if *o == pid => {
+                    reason = Some(format!("{resource:?} is already owned by this client"));
+                    break;
+                }
+                Some(Some(o)) => {
+                    reason = Some(format!("{resource:?} is owned by pid {o}"));
+                    break;
+                }
+                Some(None) | None => {}
+            }
+        }
+
+        // Claim all requested resources (registry membership validated above).
+        if reason.is_none() {
+            for resource in &resources {
+                let fd = resource_reg
+                    .get(resource)
+                    .expect("registry membership validated above")
+                    .as_raw_fd();
+                debug!("[pid {pid}] Granting fd {fd} for {resource:?}");
+                grant_fds.push(fd);
+                owners.insert(resource.clone(), Some(pid));
+            }
+        }
+        reason
+    };
+
+    match reason {
+        Some(reason) => {
             info!("[pid {pid}] Denied acquire of {:?}: {reason}", resources);
             let resp = serialize(&ServerMessage::Deny { reason })?;
             stream.write_all(&resp).await.map_err(ServerError::Write)?;
-            return Ok(());
+        }
+        None => {
+            info!(
+                "[pid {pid}] Granted {:?} ({} fd(s))",
+                resources,
+                grant_fds.len()
+            );
+            let response = serialize(&ServerMessage::Grant { resources })?;
+            stream
+                .send_with_fd(&response, &grant_fds)
+                .map_err(ServerError::Write)?;
         }
     }
-
-    let mut grant_resources: Vec<Resource> = Vec::new();
-    let mut grant_rawfds: Vec<RawFd> = Vec::new();
-
-    for resource in &resources {
-        let fd = resource_reg
-            .get(resource)
-            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
-            .as_raw_fd();
-        debug!("[pid {pid}] Granting fd {fd} for {resource:?}");
-        grant_rawfds.push(fd);
-        grant_resources.push(resource.clone());
-        owner_reg.insert(resource.clone(), Some(pid));
-    }
-
-    info!(
-        "[pid {pid}] Granted {:?} ({} fd(s))",
-        grant_resources,
-        grant_rawfds.len()
-    );
-
-    let response = serialize(&ServerMessage::Grant {
-        resources: grant_resources,
-    })?;
-
-    stream
-        .send_with_fd(&response, &grant_rawfds)
-        .map_err(ServerError::Write)?;
 
     Ok(())
 }
 
 async fn handle_client_release(pid: pid_t, resources: Vec<Resource>, owner_reg: OwnerRegistry) {
     let mut released: Vec<Resource> = Vec::new();
+    let mut not_owned: Vec<Resource> = Vec::new();
 
-    for mut entry in owner_reg.iter_mut() {
-        if resources.contains(entry.key()) {
-            match *entry.value() {
-                Some(owner) if owner == pid => {
-                    *entry.value_mut() = None;
-                    released.push(entry.key().clone());
+    {
+        let mut owners = lock_owners(&owner_reg);
+        for resource in resources {
+            match owners.get(&resource) {
+                Some(Some(o)) if *o == pid => {
+                    owners.insert(resource.clone(), None);
+                    released.push(resource);
                 }
-                Some(_) | None => {
-                    warn!(
-                        "[pid {pid}] Cannot release {:?}: not owned by this client",
-                        entry.key()
-                    );
-                }
+                _ => not_owned.push(resource),
             }
         }
     }
 
+    for resource in not_owned {
+        warn!("[pid {pid}] Cannot release {resource:?}: not owned by this client");
+    }
     if !released.is_empty() {
         info!("[pid {pid}] Released {:?}", released);
     }
@@ -178,10 +192,13 @@ async fn handle_client_release(pid: pid_t, resources: Vec<Resource>, owner_reg: 
 async fn cleanup_client_data(pid: pid_t, owner_reg: OwnerRegistry) {
     let mut released: Vec<Resource> = Vec::new();
 
-    for mut entry in owner_reg.iter_mut() {
-        if *entry.value() == Some(pid) {
-            *entry.value_mut() = None;
-            released.push(entry.key().clone());
+    {
+        let mut owners = lock_owners(&owner_reg);
+        for (resource, owner) in owners.iter_mut() {
+            if *owner == Some(pid) {
+                *owner = None;
+                released.push(resource.clone());
+            }
         }
     }
 

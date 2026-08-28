@@ -8,11 +8,11 @@ use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
 use tracing::{debug, error, info};
 
-use crate::types::{OwnerRegistry, ResourceRegistry};
+use crate::types::{lock_owners, OwnerRegistry, ResourceRegistry};
 
 pub fn query_resource() -> (ResourceRegistry, OwnerRegistry) {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
-    let owner_reg: OwnerRegistry = Arc::new(DashMap::new());
+    let owner_reg: OwnerRegistry = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     open_fbdev(resource_reg.clone(), owner_reg.clone());
     open_drm_devices(resource_reg.clone(), owner_reg.clone());
@@ -25,7 +25,7 @@ fn open_fbdev(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
         Ok(file) => {
             let fd = file.as_raw_fd();
             resource_reg.insert(Resource::Fbdev, file.into());
-            owner_reg.insert(Resource::Fbdev, None);
+            lock_owners(&owner_reg).insert(Resource::Fbdev, None);
             info!("Opened /dev/fb0");
             debug!("Registered resource Fbdev (fd {fd})");
         }
