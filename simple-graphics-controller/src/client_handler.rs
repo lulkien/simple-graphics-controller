@@ -8,7 +8,10 @@ use crate::types::lock_owners;
 use anyhow::Context;
 use nix::libc::pid_t;
 use sendfd::SendWithFd;
-use simple_graphics_protocol::{ClientRequest, Resource, ServerMessage, deserialize, serialize};
+use simple_graphics_protocol::{
+    ClientRequest, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize, parse_frame_header,
+    serialize_framed,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
@@ -30,7 +33,7 @@ pub async fn handle_connection(
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
-    let res = serialize(&ServerMessage::Advertise {
+    let res = serialize_framed(&ServerMessage::Advertise {
         available_resources: available_resources.clone(),
     })?;
 
@@ -40,49 +43,67 @@ pub async fn handle_connection(
         available_resources
     );
 
-    let mut buf = [0u8; 1024];
     loop {
-        stream
-            .readable()
-            .await
-            .context("failed to wait for socket readability")?;
+        stream.readable().await.context("failed to wait for socket readability")?;
 
-        match stream.read(&mut buf).await {
-            Ok(0) => {
+        // Read one framed message: 4-byte big-endian length, then payload.
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        match stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 debug!("[pid {client_pid}] Peer closed connection");
                 break;
             }
-
-            Ok(n) => {
-                trace!("[pid {client_pid}] Read {n} bytes");
-                let req: ClientRequest = deserialize(&buf[..n])?;
-                debug!("[pid {client_pid}] Request: {:?}", req);
-                match req {
-                    ClientRequest::Acquire { resources } => {
-                        info!("[pid {client_pid}] Acquire: {:?}", resources);
-                        handle_client_request(
-                            &mut stream,
-                            client_pid,
-                            resources,
-                            owner_reg.clone(),
-                            resource_reg.clone(),
-                        )
-                        .await?;
-                    }
-                    ClientRequest::Release { resources } => {
-                        handle_client_release(client_pid, resources, owner_reg.clone()).await;
-                    }
-                }
-            }
-
             Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    trace!("[pid {client_pid}] WouldBlock, retrying read");
-                    continue;
-                } else {
-                    error!("[pid {client_pid}] failed to read from client: {e}");
-                    break;
-                }
+                error!("[pid {client_pid}] failed to read frame header: {e}");
+                break;
+            }
+        }
+
+        let len = match parse_frame_header(&header) {
+            Ok(len) => len,
+            Err(e) => {
+                error!("[pid {client_pid}] {e}");
+                break;
+            }
+        };
+        trace!("[pid {client_pid}] Reading {len} byte payload");
+
+        let mut payload = vec![0u8; len];
+        match stream.read_exact(&mut payload).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                error!("[pid {client_pid}] Peer closed mid-frame ({len} bytes)");
+                break;
+            }
+            Err(e) => {
+                error!("[pid {client_pid}] failed to read frame payload: {e}");
+                break;
+            }
+        }
+
+        let req: ClientRequest = match deserialize(&payload) {
+            Ok(req) => req,
+            Err(e) => {
+                error!("[pid {client_pid}] {e}");
+                break;
+            }
+        };
+        debug!("[pid {client_pid}] Request: {:?}", req);
+        match req {
+            ClientRequest::Acquire { resources } => {
+                info!("[pid {client_pid}] Acquire: {:?}", resources);
+                handle_client_request(
+                    &mut stream,
+                    client_pid,
+                    resources,
+                    owner_reg.clone(),
+                    resource_reg.clone(),
+                )
+                .await?;
+            }
+            ClientRequest::Release { resources } => {
+                handle_client_release(client_pid, resources, owner_reg.clone()).await;
             }
         }
     }
@@ -145,7 +166,7 @@ async fn handle_client_request(
     match reason {
         Some(reason) => {
             info!("[pid {pid}] Denied acquire of {:?}: {reason}", resources);
-            let resp = serialize(&ServerMessage::Deny { reason })?;
+            let resp = serialize_framed(&ServerMessage::Deny { reason })?;
             stream.write_all(&resp).await.map_err(ServerError::Write)?;
         }
         None => {
@@ -154,7 +175,7 @@ async fn handle_client_request(
                 resources,
                 grant_fds.len()
             );
-            let response = serialize(&ServerMessage::Grant { resources })?;
+            let response = serialize_framed(&ServerMessage::Grant { resources })?;
             stream
                 .send_with_fd(&response, &grant_fds)
                 .map_err(ServerError::Write)?;

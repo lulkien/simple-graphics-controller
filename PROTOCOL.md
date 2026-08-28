@@ -9,9 +9,11 @@ This document is the reference for implementing clients in other languages
 - Encoding: MessagePack, as produced by `rmp_serde` with `write_named` —
   i.e. enums are string-tagged maps, fields are named maps, resources are
   plain strings. Self-describing; no integer variant tags.
-- Framing: **none**. Each message is exactly one top-level MessagePack value
-  written with a single `write()`. A robust client must read incrementally
-  until the top-level value is complete (MessagePack is self-delimiting).
+- Framing: **length-prefixed**. Every message is prefixed with a 4-byte
+  big-endian unsigned length header giving the size of the MessagePack payload
+  (max 1 MiB). Readers read 4 bytes, then exactly N bytes. This removes the
+  need to guess message boundaries on a stream socket. (Before framing, each
+  message was a bare MessagePack value.)
 - File descriptors: passed out-of-band with `SCM_RIGHTS` (one `int` per
   granted resource, same order as the `resources` field in `Grant`).
   Only `Grant` carries fds.
@@ -86,15 +88,16 @@ Example `Deny {reason: "owned"}`:
 - **Socket**: `socket(AF_UNIX, SOCK_STREAM, 0)`; set `sun_family`, `sun_path[0]=0`,
   `memcpy(sun_path+1, "sgc", 3)`; `connect()` with the full addrlen. Abstract
   sockets need no filesystem path and vanish when the server dies.
-- **Read loop**: accumulate bytes; a message is complete when the top-level
-  MessagePack value parses. MessagePack is self-delimiting — parse the
-  container headers to know when to stop (or use a small parser; do not assume
-  one `read()` returns a whole message).
-- **FD passing**: use `recvmsg()` with a 1-byte (or larger) control buffer;
-  `CMSG_SPACE(sizeof(int))` is enough for one fd, scale for multiple. Only
-  `Grant` messages carry fds; a `Grant` with N resources carries exactly N fds,
-  `fd[i]` belongs to `resources[i]`. Ownership transfers to the client — close
-  the fds when done or on `Release`.
+- **Read loop**: read 4 bytes (big-endian u32 length), validate it is within
+  the 1 MiB limit, then read exactly that many payload bytes. Do not assume a
+  single `read()` returns a whole message — loop until the exact byte count is
+  reached.
+- **FD passing**: use `recvmsg()` for **all** reads — fds are attached to the
+  first bytes of a Grant frame and a plain `read()` would silently discard
+  them. `CMSG_SPACE(sizeof(int))` is enough for one fd, scale for multiple.
+  Only `Grant` messages carry fds; a `Grant` with N resources carries exactly
+  N fds, `fd[i]` belongs to `resources[i]`. Ownership transfers to the client —
+  close the fds when done or on `Release`.
 - **Strings**: "Fbdev", variant names, field names are fixed for now, but parse
   them as arbitrary-length MessagePack strings (fixstr/str8/str16/str32) to stay
   compatible. Same for arrays/maps (fix/16/32 forms).
