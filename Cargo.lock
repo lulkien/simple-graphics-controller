@@ -874,6 +874,7 @@ dependencies = [
  "nix 0.29.0",
  "sendfd",
  "simple-graphics-protocol",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -3,6 +3,7 @@ use std::{
     os::fd::{AsRawFd, RawFd},
 };
 
+use crate::error::{ServerError, ServerResult};
 use anyhow::Context;
 use nix::libc::pid_t;
 use sendfd::SendWithFd;
@@ -20,8 +21,8 @@ pub async fn handle_connection(
     client_pid: pid_t,
     owner_reg: OwnerRegistry,
     resource_reg: ResourceRegistry,
-) -> anyhow::Result<()> {
-    info!("New client connected: {client_pid}");
+) -> ServerResult<()> {
+    info!("[pid {client_pid}] New client connected");
 
     // Send available resources immediately (no Hello handshake needed)
     let available_resources: Vec<Resource> = resource_reg
@@ -29,30 +30,35 @@ pub async fn handle_connection(
         .map(|entry| entry.key().clone())
         .collect();
     let res = serialize(&ServerMessage::Advertise {
-        available_resources,
-    })
-    .context("serialize failed")?;
+        available_resources: available_resources.clone(),
+    })?;
 
-    stream.write_all(&res).await.context("write failed")?;
-    info!("Sent Advertise");
+    stream.write_all(&res).await.map_err(ServerError::Write)?;
+    debug!(
+        "[pid {client_pid}] Sent Advertise: {:?}",
+        available_resources
+    );
 
     let mut buf = [0u8; 1024];
     loop {
-        stream.readable().await.context("readable failed")?;
+        stream
+            .readable()
+            .await
+            .context("failed to wait for socket readability")?;
 
         match stream.read(&mut buf).await {
             Ok(0) => {
-                debug!("Client disconnected");
+                debug!("[pid {client_pid}] Peer closed connection");
                 break;
             }
 
             Ok(n) => {
-                trace!("Read {n} bytes");
-                let req: ClientRequest = deserialize(&buf[..n]).context("deserialize failed")?;
-                debug!("Request: {:?}", req);
+                trace!("[pid {client_pid}] Read {n} bytes");
+                let req: ClientRequest = deserialize(&buf[..n])?;
+                debug!("[pid {client_pid}] Request: {:?}", req);
                 match req {
                     ClientRequest::Acquire { resources } => {
-                        info!("Handling Acquire: {:?}", resources);
+                        info!("[pid {client_pid}] Acquire: {:?}", resources);
                         handle_client_request(
                             &mut stream,
                             client_pid,
@@ -70,17 +76,17 @@ pub async fn handle_connection(
 
             Err(e) => {
                 if e.kind() == ErrorKind::WouldBlock {
-                    trace!("WouldBlock");
+                    trace!("[pid {client_pid}] WouldBlock, retrying read");
                     continue;
                 } else {
-                    error!("{e}");
+                    error!("[pid {client_pid}] failed to read from client: {e}");
                     break;
                 }
             }
         }
     }
 
-    info!("Client disconnected");
+    info!("[pid {client_pid}] Client disconnected");
     cleanup_client_data(client_pid, owner_reg).await;
 
     Ok(())
@@ -93,71 +99,95 @@ async fn handle_client_request(
     resources: Vec<Resource>,
     owner_reg: OwnerRegistry,
     resource_reg: ResourceRegistry,
-) -> anyhow::Result<()> {
-    let mut grant_resources: Vec<Resource> = Vec::new();
-    let mut grant_rawfds: Vec<RawFd> = Vec::new();
-
-    for resource in resources {
-        let owner = *owner_reg.get(&resource).expect("get owner failed");
-        match owner {
-            Some(o) => {
-                if o == pid {
-                    warn!("Already owned");
-                } else {
-                    warn!("Owned by other process: {}", o);
-                }
-                continue;
-            }
-            None => {
-                grant_rawfds.push(
-                    resource_reg
-                        .get(&resource)
-                        .context("get fd failed")?
-                        .as_raw_fd(),
-                );
-
-                info!("Grant resource: {:?}", resource);
-                grant_resources.push(resource.clone());
-                owner_reg.insert(resource, Some(pid));
-            }
+) -> ServerResult<()> {
+    // Atomic acquire: if any requested resource is not free, deny the whole
+    // request and grant nothing.
+    for resource in &resources {
+        let owner = *owner_reg
+            .get(resource)
+            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} has no owner entry"))?;
+        let reason = match owner {
+            Some(o) if o == pid => Some(format!("{resource:?} is already owned by this client")),
+            Some(o) => Some(format!("{resource:?} is owned by pid {o}")),
+            None => None,
+        };
+        if let Some(reason) = reason {
+            info!("[pid {pid}] Denied acquire of {:?}: {reason}", resources);
+            let resp = serialize(&ServerMessage::Deny { reason })?;
+            stream.write_all(&resp).await.map_err(ServerError::Write)?;
+            return Ok(());
         }
     }
 
+    let mut grant_resources: Vec<Resource> = Vec::new();
+    let mut grant_rawfds: Vec<RawFd> = Vec::new();
+
+    for resource in &resources {
+        let fd = resource_reg
+            .get(resource)
+            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
+            .as_raw_fd();
+        debug!("[pid {pid}] Granting fd {fd} for {resource:?}");
+        grant_rawfds.push(fd);
+        grant_resources.push(resource.clone());
+        owner_reg.insert(resource.clone(), Some(pid));
+    }
+
+    info!(
+        "[pid {pid}] Granted {:?} ({} fd(s))",
+        grant_resources,
+        grant_rawfds.len()
+    );
+
     let response = serialize(&ServerMessage::Grant {
         resources: grant_resources,
-    })
-    .context("serialize failed")?;
+    })?;
 
     stream
         .send_with_fd(&response, &grant_rawfds)
-        .context("write failed")?;
+        .map_err(ServerError::Write)?;
 
     Ok(())
 }
 
 async fn handle_client_release(pid: pid_t, resources: Vec<Resource>, owner_reg: OwnerRegistry) {
-    info!("Release resources: {:?}", resources);
+    let mut released: Vec<Resource> = Vec::new();
 
     for mut entry in owner_reg.iter_mut() {
         if resources.contains(entry.key()) {
             match *entry.value() {
                 Some(owner) if owner == pid => {
                     *entry.value_mut() = None;
+                    released.push(entry.key().clone());
                 }
                 Some(_) | None => {
-                    warn!("It's not belong to you: {pid}");
+                    warn!(
+                        "[pid {pid}] Cannot release {:?}: not owned by this client",
+                        entry.key()
+                    );
                 }
             }
         }
     }
+
+    if !released.is_empty() {
+        info!("[pid {pid}] Released {:?}", released);
+    }
 }
 
 async fn cleanup_client_data(pid: pid_t, owner_reg: OwnerRegistry) {
-    info!("Clean up client");
+    let mut released: Vec<Resource> = Vec::new();
 
     for mut entry in owner_reg.iter_mut() {
         if *entry.value() == Some(pid) {
             *entry.value_mut() = None;
+            released.push(entry.key().clone());
         }
+    }
+
+    if released.is_empty() {
+        debug!("[pid {pid}] Cleaned up, no resources held");
+    } else {
+        info!("[pid {pid}] Cleaned up, released {:?}", released);
     }
 }
