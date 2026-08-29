@@ -132,3 +132,11 @@ Logging is controlled by `RUST_LOG` (default: `info`):
 RUST_LOG=debug ./simple-graphics-controller               # + message details, fds, peer creds
 RUST_LOG=trace ./simple-graphics-controller               # + raw byte counts
 ```
+
+Windowing policy is selected by `SGC_POLICY` (default `fair-queue`):
+
+```sh
+SGC_POLICY=fair-queue ./simple-graphics-controller        # default: preempt + FIFO waiters
+SGC_POLICY=latest-owner ./simple-graphics-controller      # newest opener wins (LIFO)
+SGC_POLICY=first-owner ./simple-graphics-controller       # first holder keeps it; others denied
+```
