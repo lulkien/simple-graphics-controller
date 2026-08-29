@@ -14,6 +14,8 @@ mod client_handler;
 mod error;
 mod resource_manager;
 mod types;
+#[allow(dead_code)] // policy layer is wired into the engine in a later phase
+mod windowing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
