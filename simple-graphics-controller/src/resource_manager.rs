@@ -8,24 +8,24 @@ use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
 use tracing::{debug, error, info};
 
-use crate::types::{lock_owners, OwnerRegistry, ResourceRegistry};
+use crate::types::ResourceRegistry;
 
-pub fn query_resource() -> (ResourceRegistry, OwnerRegistry) {
+/// Open and register every available graphics resource. Ownership is NOT
+/// tracked here anymore — that is the policy engine's job.
+pub fn query_resource() -> ResourceRegistry {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
-    let owner_reg: OwnerRegistry = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    open_fbdev(resource_reg.clone(), owner_reg.clone());
-    open_drm_devices(resource_reg.clone(), owner_reg.clone());
+    open_fbdev(resource_reg.clone());
+    open_drm_devices(resource_reg.clone());
 
-    (resource_reg, owner_reg)
+    resource_reg
 }
 
-fn open_fbdev(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
+fn open_fbdev(resource_reg: ResourceRegistry) {
     match File::options().read(true).write(true).open("/dev/fb0") {
         Ok(file) => {
             let fd = file.as_raw_fd();
             resource_reg.insert(Resource::Fbdev, file.into());
-            lock_owners(&owner_reg).insert(Resource::Fbdev, None);
             info!("Opened /dev/fb0");
             debug!("Registered resource Fbdev (fd {fd})");
         }
@@ -36,7 +36,7 @@ fn open_fbdev(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
 }
 
 #[allow(unused)]
-fn open_drm_devices(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
+fn open_drm_devices(resource_reg: ResourceRegistry) {
     let entries = match read_dir("/dev/dri/") {
         Ok(entries) => entries,
         Err(e) => {
@@ -58,5 +58,8 @@ fn open_drm_devices(resource_reg: ResourceRegistry, owner_reg: OwnerRegistry) {
         .collect::<Vec<_>>();
 
     paths.sort();
-    debug!("DRM devices present: {:?} (not exposed as resources yet)", paths);
+    debug!(
+        "DRM devices present: {:?} (not exposed as resources yet)",
+        paths
+    );
 }

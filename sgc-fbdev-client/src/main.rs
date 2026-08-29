@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::ErrorKind,
     os::{
         fd::{FromRawFd, OwnedFd, RawFd},
@@ -67,82 +66,11 @@ async fn read_message(stream: &mut UnixStream) -> ClientResult<(ServerMessage, V
     Ok((msg, fds))
 }
 
-#[tokio::main]
-async fn main() {
-    // Connect to abstract namespace socket @sgc
-    let std_addr = StdSocketAddr::from_abstract_name(b"sgc").expect("invalid socket address");
-    let tokio_addr: SocketAddr = SocketAddr::from(std_addr);
-
-    // Connect to the server
-    let mut stream = UnixStream::connect_addr(&tokio_addr)
-        .await
-        .expect("failed to connect to socket");
-
-    let mut resources_map: HashMap<Resource, Option<RawFd>> = Default::default();
-
-    // Read Advertise response (no FDs)
-    let (msg, fds) = read_message(&mut stream)
-        .await
-        .expect("read advertise failed");
-    assert!(fds.is_empty(), "Advertise should not carry fds");
-    match msg {
-        ServerMessage::Advertise {
-            available_resources,
-        } => {
-            println!("Available resources: {:?}", available_resources);
-            for resource in available_resources {
-                resources_map.insert(resource, None);
-            }
-        }
-        _ => {
-            eprintln!("Expected Advertise, got {:?}", msg);
-            return;
-        }
-    }
-
-    // Request Fbdev
-    let req = ClientRequest::Acquire {
-        resources: vec![Resource::Fbdev],
-    };
-    let data = serialize_framed(&req).expect("serialize request failed");
-    stream.write_all(&data).await.expect("write failed");
-    println!("Sent Acquire for Fbdev");
-
-    // Read Grant with FD
-    let (msg, fds) = read_message(&mut stream).await.expect("read grant failed");
-    match msg {
-        ServerMessage::Grant { resources } => {
-            println!("Granted: {:?}", resources);
-            assert_eq!(fds.len(), resources.len(), "one fd per granted resource");
-            for (idx, resource) in resources.into_iter().enumerate() {
-                resources_map.insert(resource, Some(fds[idx]));
-            }
-
-            // Acknowledge the grant so the server knows it landed.
-            let ack = serialize_framed(&ClientRequest::Ack).expect("serialize ack failed");
-            stream.write_all(&ack).await.expect("write ack failed");
-            println!("Sent Ack");
-        }
-        ServerMessage::Deny { reason } => {
-            println!("Denied: {reason}");
-            return;
-        }
-        _ => {
-            eprintln!("Unexpected response: {:?}", msg);
-            return;
-        }
-    }
-
-    let mut framebuffer = Framebuffer::open_with_fd(
-        resources_map
-            .get(&Resource::Fbdev)
-            .expect("get fbdev failed")
-            .unwrap(),
-    )
-    .expect("framebuffer open failed");
+/// Draw the demo scene on the given framebuffer fd.
+fn draw(fd: RawFd) -> ClientResult<()> {
+    let mut framebuffer = Framebuffer::open_with_fd(fd).expect("framebuffer open failed");
 
     let mut compositor = framebuffer.compositor((255, 255, 255).into());
-
     compositor
         .add(
             "rect1",
@@ -183,35 +111,128 @@ async fn main() {
     // Really changing screen contents
     framebuffer.flush();
 
-    release_resource(&mut stream, &mut resources_map).await;
+    Ok(())
 }
 
-async fn release_resource(
-    stream: &mut UnixStream,
-    resource_reg: &mut HashMap<Resource, Option<RawFd>>,
-) {
-    let held_resources: Vec<Resource> = resource_reg
-        .iter()
-        .filter(|(_, fd)| fd.is_some())
-        .map(|(resource, _)| resource.clone())
-        .collect();
+/// Close our dup'd copies of the granted fds (the server keeps its own).
+fn close_fds(fds: &[RawFd]) {
+    for &raw_fd in fds {
+        // Safety: these fds were received through SCM_RIGHTS and ownership
+        // is transferred to this process.
+        unsafe {
+            drop(OwnedFd::from_raw_fd(raw_fd));
+        }
+    }
+}
 
-    for resource in &held_resources {
-        if let Some(Some(raw_fd)) = resource_reg.get_mut(resource).map(Option::take) {
-            // `OwnedFd` closes the file descriptor when it is dropped.
-            //
-            // Safety: this RawFd was received through SCM_RIGHTS and ownership
-            // is transferred to this process.
-            unsafe {
-                drop(OwnedFd::from_raw_fd(raw_fd));
+/// Tell the server we are done with Fbdev (also the revoke acknowledgment).
+async fn send_release(stream: &mut UnixStream) -> ClientResult<()> {
+    let rel = ClientRequest::Release {
+        resources: vec![Resource::Fbdev],
+    };
+    let data = serialize_framed(&rel)?;
+    stream.write_all(&data).await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ClientResult<()> {
+    // --hold: keep running after drawing so a second instance can preempt
+    // us (Revoke -> Release -> re-Grant -> draw again). Default: draw,
+    // release, exit (old linear behavior).
+    let hold = std::env::args().any(|arg| arg == "--hold");
+
+    // Connect to abstract namespace socket @sgc
+    let std_addr = StdSocketAddr::from_abstract_name(b"sgc").expect("invalid socket address");
+    let tokio_addr: SocketAddr = SocketAddr::from(std_addr);
+    let mut stream = UnixStream::connect_addr(&tokio_addr)
+        .await
+        .expect("failed to connect to socket");
+
+    // Read Advertise response (no FDs)
+    let (msg, fds) = read_message(&mut stream)
+        .await
+        .expect("read advertise failed");
+    assert!(fds.is_empty(), "Advertise should not carry fds");
+    let ServerMessage::Advertise { available_resources } = msg else {
+        eprintln!("Expected Advertise, got {msg:?}");
+        return Ok(());
+    };
+    println!("Available resources: {available_resources:?}");
+
+    // Request Fbdev. The answer may come immediately (Grant/Deny) or later
+    // (Queued -> Grant via the engine's handoff) — either way the loop
+    // below is the single place that handles it.
+    let req = ClientRequest::Acquire {
+        resources: vec![Resource::Fbdev],
+    };
+    let data = serialize_framed(&req).expect("serialize request failed");
+    stream.write_all(&data).await.expect("write failed");
+    println!("Sent Acquire for Fbdev");
+
+    // Fds we currently hold (dup'd copies of the server's grant).
+    let mut held_fds: Vec<RawFd> = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = stream.readable() => {
+                let (msg, fds) = match read_message(&mut stream).await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("Server connection lost: {e}");
+                        break;
+                    }
+                };
+                match msg {
+                    ServerMessage::Grant { resources } => {
+                        println!("Granted: {resources:?}");
+                        assert_eq!(fds.len(), resources.len(), "one fd per granted resource");
+                        held_fds.extend_from_slice(&fds);
+                        for &fd in &fds {
+                            if let Err(e) = draw(fd) {
+                                eprintln!("draw failed: {e}");
+                            }
+                        }
+                        println!("Drawing (hold={hold})");
+
+                        // Acknowledge the grant so the server knows it landed.
+                        let ack = serialize_framed(&ClientRequest::Ack).expect("serialize ack failed");
+                        stream.write_all(&ack).await.expect("write ack failed");
+                        println!("Sent Ack");
+
+                        if !hold {
+                            // Old behavior: draw once, hand back, exit.
+                            close_fds(&held_fds);
+                            held_fds.clear();
+                            send_release(&mut stream).await?;
+                            println!("Sent Release");
+                            break;
+                        }
+                    }
+                    ServerMessage::Revoke { resources } => {
+                        println!("Revoked: {resources:?} — releasing");
+                        close_fds(&held_fds);
+                        held_fds.clear();
+                        send_release(&mut stream).await?;
+                        println!("Sent Release (revoke-ack); waiting for re-grant");
+                        // If the engine requeues us, a Grant arrives without
+                        // a preceding Acquire — handled above.
+                    }
+                    ServerMessage::Deny { reason } => {
+                        eprintln!("Denied: {reason}");
+                        break;
+                    }
+                    ServerMessage::Advertise { .. } => {
+                        eprintln!("Unexpected duplicate Advertise");
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C, exiting");
+                break;
             }
         }
     }
 
-    let rel = ClientRequest::Release {
-        resources: vec![Resource::Fbdev],
-    };
-    let data = serialize_framed(&rel).expect("serialize release failed");
-    stream.write_all(&data).await.expect("write release failed");
-    println!("Sent Release");
+    Ok(())
 }

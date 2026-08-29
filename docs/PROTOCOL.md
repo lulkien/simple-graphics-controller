@@ -42,20 +42,49 @@ client                          server
   |       Release {resources}      |
   |------------------------------->|
   |                                |
-  |             Revoke             |   (not currently sent by the server)
+  |             Revoke             |   (server-initiated preemption)
+  |<-------------------------------|
+  |                                |
+  |       Release {resources}      |   (the revoke acknowledgment)
+  |------------------------------->|
+  |                                |
+  |              Grant             |   to the next waiter
   |<-------------------------------|
 ```
 
 On connect the server immediately sends `Advertise` (no hello handshake).
-`Acquire` is **atomic**: if any requested resource is not free — owned by
-another client, or already owned by the requesting client — the server denies
-the *entire* request with `Deny {reason}` and grants nothing.
+
+`Acquire` is arbitrated by the server's windowing policy (per-resource,
+selected by the `SGC_POLICY` server env: `first-owner` | `latest-owner` |
+`fair-queue`, default `fair-queue`):
+
+- resource **free** -> `Grant` immediately;
+- resource **owned by another client** -> `Deny` (first-owner) or the
+  request is **queued** and the owner is preempted (latest-owner /
+  fair-queue);
+- resource **already owned by the requester** -> `Deny`.
+
+v1 limitation: one resource per `Acquire`; multi-resource requests are
+denied with a reason.
+
+A **queued** `Acquire` gets NO immediate reply — the client simply waits;
+the `Grant` arrives when the resource frees. Note that a `Grant` can arrive
+with no preceding `Acquire`: it means the client was re-granted after being
+preempted. Clients must keep reading after `Release`.
+
+Preemption handoff: the server sends `Revoke {resources}` to the current
+owner; the owner stops using the resource and replies `Release` — that
+`Release` doubles as the revoke acknowledgment, and the server then grants
+the resource to the next waiter (the preempted owner is requeued and gets
+one more turn). If the owner neither releases nor disconnects within
+**5 seconds**, the server force-reclaims the resource and grants the next
+waiter anyway.
 
 After sending `Grant`, the server waits up to **5 seconds** for the client to
 reply with `Ack` (sent only after the client successfully received the grant
-and its fds). If no `Ack` arrives in time — or the client sends something else
-first — the server logs a warning that the grant is unconfirmed. The resource
-stays owned by the client either way; `Ack` is a delivery signal, not a lease.
+and its fds). If no `Ack` arrives in time, the server logs a warning that the
+grant is unconfirmed. The resource stays owned by the client either way;
+`Ack` is a delivery signal, not a lease — it never gates the queue.
 
 ## Messages
 
