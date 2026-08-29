@@ -14,7 +14,7 @@ use simple_graphics_protocol::{
     serialize_framed,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::UnixStream,
     sync::mpsc,
     time::Instant,
@@ -25,14 +25,6 @@ use tracing::{debug, error, info, trace, warn};
 /// declaring the grant unconfirmed. Delivery signal only — it never gates
 /// ownership or the queue (the fd was already duplicated to the client).
 const GRANT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Outcome of reading one framed message from a client.
-enum MessageRead {
-    /// A complete, deserialized request.
-    Message(ClientRequest),
-    /// The peer closed the connection cleanly.
-    Closed,
-}
 
 pub async fn handle_connection(
     mut stream: UnixStream,
@@ -57,19 +49,28 @@ pub async fn handle_connection(
         available_resources: available_resources.clone(),
     })?;
     stream.write_all(&res).await.map_err(ServerError::Write)?;
-    debug!("[client {client_id} (pid {client_pid})] Sent Advertise: {available_resources:?}");
+    debug!(
+        "[client {client_id} (pid {client_pid})] Sent Advertise: {available_resources:?}"
+    );
 
     let mut ack_deadline: Option<Instant> = None;
+    // Bytes read from the wire but not yet assembled into a complete frame.
+    // Persists across select! iterations: a frame split across reads must
+    // survive even when the control channel wins the next select.
+    let mut frame_buf: Vec<u8> = Vec::new();
+
     // Wrap the loop so engine.disconnected() ALWAYS runs, even when an arm
     // propagates an error (e.g. EPIPE writing to a client that just died) —
     // otherwise the engine would keep a dead client as owner forever.
     let result: ServerResult<()> = async {
         loop {
             tokio::select! {
-                // Wire: a client request.
+                // Wire: a client request (never blocks on a partial frame —
+                // see process_wire_bytes; the control channel stays live).
                 _ = stream.readable() => {
-                    if !process_wire_read(
+                    if !process_wire_bytes(
                         &mut stream,
+                        &mut frame_buf,
                         client_id,
                         client_pid,
                         &engine,
@@ -91,7 +92,16 @@ pub async fn handle_connection(
                     ).await?;
                 }
                 // Grant delivery ack timeout (log-only; never gates ownership).
-                _ = tokio::time::sleep_until(ack_deadline.expect("guarded by if")), if ack_deadline.is_some() => {
+                // NOTE: select! evaluates this future EXPRESSION eagerly,
+                // before any if-guard would be checked — so it must not
+                // panic on None. Pending forever while no grant awaits an ack.
+                _ = async {
+                    if let Some(deadline) = ack_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
                     warn!("[client {client_id} (pid {client_pid})] Grant not acknowledged within {GRANT_ACK_TIMEOUT:?}");
                     ack_deadline = None;
                 }
@@ -108,52 +118,100 @@ pub async fn handle_connection(
     Ok(())
 }
 
-/// Read one framed request and act on it. Returns `Ok(true)` to keep the
-/// connection loop going, `Ok(false)` when the peer closed or the read
-/// failed (the error is logged here; nothing to propagate).
-async fn process_wire_read(
+/// Drain the socket (non-blocking), assemble complete frames in `frame_buf`,
+/// and dispatch each request. Returns `Ok(true)` to keep the connection
+/// loop going, `Ok(false)` on EOF.
+///
+/// Never blocks: a partial frame just stays in `frame_buf` until the next
+/// readable event. This is what keeps the control channel (Revoke/Grant)
+/// responsive while a client dribbles bytes in.
+async fn process_wire_bytes(
     stream: &mut UnixStream,
+    frame_buf: &mut Vec<u8>,
     client_id: ClientId,
     client_pid: pid_t,
     engine: &PolicyEngine,
     resource_reg: &ResourceRegistry,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<bool> {
-    match read_message(stream, client_id, client_pid).await {
-        Ok(MessageRead::Message(req)) => {
-            debug!("[client {client_id} (pid {client_pid})] Request: {req:?}");
-            match req {
-                ClientRequest::Acquire { resources } => {
-                    handle_acquire(
-                        stream,
-                        client_id,
-                        client_pid,
-                        resources,
-                        engine,
-                        resource_reg,
-                        ack_deadline,
-                    )
-                    .await?;
-                }
-                ClientRequest::Release { resources } => {
-                    handle_release(client_id, resources, engine).await;
-                }
-                ClientRequest::Ack => {
-                    info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
-                    *ack_deadline = None;
-                }
+    // Drain whatever is available right now (WouldBlock = back to select!).
+    let mut tmp = [0u8; 4096];
+    loop {
+        match stream.try_read(&mut tmp) {
+            Ok(0) => return Ok(false), // peer closed
+            Ok(n) => {
+                trace!("[client {client_id} (pid {client_pid})] read {n} bytes");
+                frame_buf.extend_from_slice(&tmp[..n]);
             }
-            Ok(true)
-        }
-        Ok(MessageRead::Closed) => {
-            debug!("[client {client_id} (pid {client_pid})] Peer closed connection");
-            Ok(false)
-        }
-        Err(e) => {
-            error!("[client {client_id} (pid {client_pid})] {e}");
-            Ok(false)
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to read from client: {e}").into());
+            }
         }
     }
+
+    // Dispatch every complete frame currently buffered.
+    while frame_buf.len() >= FRAME_HEADER_LEN {
+        let header: [u8; FRAME_HEADER_LEN] = frame_buf[..FRAME_HEADER_LEN]
+            .try_into()
+            .expect("length checked above");
+        let len = parse_frame_header(&header).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if frame_buf.len() < FRAME_HEADER_LEN + len {
+            break; // incomplete frame; wait for more bytes
+        }
+
+        let payload: Vec<u8> = frame_buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len].to_vec();
+        frame_buf.drain(..FRAME_HEADER_LEN + len);
+
+        let req: ClientRequest = deserialize(&payload).map_err(|e| anyhow::anyhow!("{e}"))?;
+        debug!("[client {client_id} (pid {client_pid})] Request: {req:?}");
+        dispatch_request(
+            req,
+            stream,
+            client_id,
+            client_pid,
+            engine,
+            resource_reg,
+            ack_deadline,
+        )
+        .await?;
+    }
+
+    Ok(true)
+}
+
+/// Handle one parsed client request.
+async fn dispatch_request(
+    req: ClientRequest,
+    stream: &mut UnixStream,
+    client_id: ClientId,
+    client_pid: pid_t,
+    engine: &PolicyEngine,
+    resource_reg: &ResourceRegistry,
+    ack_deadline: &mut Option<Instant>,
+) -> ServerResult<()> {
+    match req {
+        ClientRequest::Acquire { resources } => {
+            handle_acquire(
+                stream,
+                client_id,
+                client_pid,
+                resources,
+                engine,
+                resource_reg,
+                ack_deadline,
+            )
+            .await?;
+        }
+        ClientRequest::Release { resources } => {
+            handle_release(client_id, resources, engine).await;
+        }
+        ClientRequest::Ack => {
+            info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
+            *ack_deadline = None;
+        }
+    }
+    Ok(())
 }
 
 /// Act on a message pushed by the engine through the control channel.
@@ -177,46 +235,6 @@ async fn process_control_message(
         }
     }
     Ok(())
-}
-
-/// Wait for and read one framed request from the client.
-///
-/// Stream sockets do not preserve message boundaries, so the 4-byte length
-/// header tells us exactly how much to read. Readiness is driven by the
-/// caller's `select!`; if the peer stalls mid-frame the control channel
-/// messages queue up and are delivered once the frame completes.
-async fn read_message(
-    stream: &mut UnixStream,
-    client_id: ClientId,
-    client_pid: pid_t,
-) -> ServerResult<MessageRead> {
-    // Frame header: 4-byte big-endian payload length.
-    let mut header = [0u8; FRAME_HEADER_LEN];
-    match stream.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(MessageRead::Closed),
-        Err(e) => {
-            return Err(anyhow::anyhow!("failed to read frame header: {e}").into());
-        }
-    }
-
-    let len = parse_frame_header(&header).map_err(|e| anyhow::anyhow!("{e}"))?;
-    trace!("[client {client_id} (pid {client_pid})] Reading {len} byte payload");
-
-    // Payload.
-    let mut payload = vec![0u8; len];
-    match stream.read_exact(&mut payload).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-            return Err(anyhow::anyhow!("peer closed mid-frame ({len} bytes)").into());
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("failed to read frame payload: {e}").into());
-        }
-    }
-
-    let req: ClientRequest = deserialize(&payload).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(MessageRead::Message(req))
 }
 
 /// Handle an Acquire: ask the engine, then act on its decision.
