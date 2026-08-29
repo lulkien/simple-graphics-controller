@@ -346,3 +346,25 @@ screen; no app can starve another by repeatedly opening.
 - Under preemptive policies an `Acquire` never fails for "owned" — the
   client blocks until `Grant` or `Deny`. Cancelling = disconnect (dequeues).
   A `CancelAcquire` message is the natural future extension.
+
+## Future: exclusion groups (fbdev vs drm)
+
+Fbdev and DRM are two access paths to the SAME display — they cannot be
+granted at the same time, not even to the same client. When DRM is exposed
+(`Resource::Drm` + `/dev/dri/card*` fds registered), the engine's
+arbitration unit becomes a GROUP, not a resource:
+
+- group "Display" = { Fbdev, Drm }; invariant: at most one granted, ever.
+- `Acquire{drm}` while fbdev is held -> exactly today's preempt path
+  (revoke the fbdev holder, queue, grant drm when freed).
+- Waiter entries carry the REQUESTED resource — a requeued fbdev holder
+  still wants fbdev even if the newcomer asked for drm.
+- Grant delivers the fd of the requested resource (both fds live in the
+  registry). Distinct variants are REQUIRED: the client must know the fd's
+  type to use it (fbdev ioctls vs drmMode*).
+- A multi-resource Acquire spanning one group is invalid (mutually
+  exclusive) -> denied, no deadlock case to design for.
+
+NOT implemented yet: only Fbdev is exposed, and per-resource slots are
+exactly correct until then. The trigger is the commit that exposes
+`Resource::Drm`.
