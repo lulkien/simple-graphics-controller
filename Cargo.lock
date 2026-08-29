@@ -405,6 +405,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libsgc-rs"
+version = "0.1.0"
+dependencies = [
+ "simple-graphics-protocol",
+ "thiserror",
+]
+
+[[package]]
 name = "linfb"
 version = "0.2.1"
 source = "git+https://github.com/lulkien/linfb#79ee002aa7b1e72955940a2de4bbc54208d7f769"
