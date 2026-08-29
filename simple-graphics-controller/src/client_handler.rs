@@ -19,7 +19,7 @@ use tokio::{
     sync::mpsc,
     time::Instant,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// How long the server waits for a client to acknowledge a Grant before
 /// declaring the grant unconfirmed. Delivery signal only — it never gates

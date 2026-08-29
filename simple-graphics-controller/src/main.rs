@@ -23,6 +23,9 @@ mod resource_manager;
 mod types;
 mod windowing;
 
+#[cfg(test)]
+mod integration_tests;
+
 /// Monotonic connection counter. Starts at 1 so `ClientId(0)` stays free as
 /// a "no client" sentinel; ids are never reused while the server runs
 /// (unlike pid_t, which the kernel recycles).
