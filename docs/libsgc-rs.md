@@ -1,295 +1,188 @@
 # libsgc-rs — client library design
 
 Rust client library for `simple-graphics-controller` (`@sgc`). Apps link the
-crate and drive a `SgcClient`; all wire work (framing, SCM_RIGHTS fd passing,
-`Ack`, the `Revoke` handshake, re-grant) happens on the library's own reader
-thread. The app calls blocking `acquire`/`release` and drains `SgcEvent`s for
-ownership changes it did not ask for.
+crate and drive a `SgcClient`; the client is a PLAIN SYNCHRONOUS wrapper
+over the stream — one struct, one field, driven by ONE app thread. No
+reader thread, no mutexes, no internal channels, no Drop impl.
+
+This design is validated end-to-end in `sgc-fbdev-client` and
+`sgc-fbdev-client-2` (identical architecture, different scenes): connect,
+acquire, full preemption cycle (A holds → B preempts → A revoked with auto
+revoke-ack → B granted → server requeues A → A re-granted → draws again)
+on host + aarch64 board with a real `/dev/fb0`. libsgc-rs is the
+extraction of that validated client code.
+
+## The one decision: no reader thread
+
+The threaded design (background "sgc-reader" thread + shared-state struct +
+event receiver) was rejected as over-complicated. The final shape:
+
+    pub struct SgcClient { stream: UnixStream }
+
+Why this is sound: the app thread is ALWAYS on the socket when it matters —
+blocked in `acquire()` it is not the owner yet (the server only revokes
+owners, so no Revoke can target a queued acquirer), and blocked in
+`start_event_loop()` it is always listening, so the server's 5s
+revoke/ack deadlines are met. An app that must do other work while holding
+the resource runs this client on its own thread — exactly like the demo's
+main thread does next to the render thread.
+
+Contract (stated once): while holding the resource, the client's thread
+must stay in the event loop.
 
 ## Usage model (the app's view)
 
 ```
-app start -> SgcClient::connect()            spawns the lib's reader thread
-             fd = client.acquire(Fbdev)?     BLOCKS until the server answers
-             Ok(fd)       -> render thread draws with fd
-             Err(Denied)  -> not allowed; retry later or give up
-             ... render ...
-             client.release(Fbdev)            voluntary hand-back (returns
-                                              once the Release is written)
-preempted:  event: Revoked { resource }      drop fd, stop rendering
-                                             (lib already sent the revoke-ack
-                                              Release — resource disowned)
-regranted:  event: Granted { resource, fd }  render again with the new fd —
-                                             no acquire needed
+app start -> SgcClient::connect()                 connect + read Advertise
+             fd = client.acquire(Fbdev)?          BLOCKS until the server
+                                                  answers (queued requests
+                                                  block here too)
+             Ok(fd)       -> spawn render task, send it the fd
+             Err(Denied)  -> not allowed; give up (or retry later)
+             client.start_event_loop(&render_tx)  BLOCKS until the
+                                                  connection ends; drives
+                                                  the render task
+revoked:    wire Revoke   -> send RenderCmd::Stop, reply Release
+                             (the revoke-ack — resource disowned)
+regranted:  wire Grant+fd -> send Ack, send RenderCmd::Draw(fd) — no
+                             acquire needed
+disconnect: EOF/error     -> send Stop, return
 ```
 
-- `acquire()`/`release()` BLOCK the calling thread until their outcome is
-  known: when `acquire()` returns you KNOW whether you may use the resource
-  (`Ok(fd)` = yes, `Err(Denied)` = no). All wire I/O still happens on the
-  library's own reader thread; the calling thread waits on a reply channel.
-- The event receiver (`mpsc::Receiver<SgcEvent>` from `connect`) is the
-  channel between the lib thread and the app's main/render threads: it
-  carries the re-granted fd (`OwnedFd` is `Send`).
-- Re-grant after revoke is an EVENT (`Granted { fd }`), not an `acquire()`
-  result: the server handed the resource back on its own. `acquire()` is
-  only for requesting (startup / after a voluntary `release()`).
-- An app that must not block its main thread calls `acquire()` from a
-  worker thread (or accepts the block — there is nothing to render before
-  the fd).
+- `acquire()` BLOCKS the calling thread until the outcome is known:
+  `Ok(fd)` = you may use the resource, `Err(Denied)` = you may not.
+  Queued requests are indistinguishable from immediate grants — the
+  blocked caller cannot tell "queued then granted" from "granted
+  immediately", which is the point.
+- Re-grant after revoke is a WIRE `Grant` handled inside the event loop
+  (mapped to `RenderCmd::Draw(fd)`), not an `acquire()` result: the
+  server handed the resource back on its own. `acquire()` is only for
+  requesting (startup).
+- There is NO event enum: the client maps wire messages straight to the
+  app's command type (`RenderCmd`). Demo-internal coupling is fine; the
+  lib extraction decides later whether to generalize.
 
-### Failure semantics (what the app must handle)
+## API (final shape)
 
-- `Revoked` is NON-fatal: drop the fd, stop rendering — everything else in
-  the app keeps running (the library already sent the revoke-ack `Release`;
-  the session stays connected). A later `Granted { fd }` resumes rendering.
-- Session over (server died / connection dropped) IS fatal: the reader
-  thread exits, so the event receiver's senders drop — the app's `recv()`
-  returns `Err(Disconnected)` — and any blocked `acquire()` returns
-  `Err(HandlePoisoned)`. The app drops its fds and exits (or reconnects).
-  This is the ONLY fatal condition; there is no other signal.
+    pub struct SgcClient { stream: UnixStream }   // single field, NOT Clone, &mut self
 
-## Status
+    impl SgcClient {
+        pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
+            // connect + read Advertise; returns the advertised list so the
+            // app can fail fast ("server does not offer Fbdev") instead of
+            // eating a Deny round trip.
+        pub fn acquire(&mut self, Resource) -> Result<OwnedFd, SgcError>;
+            // write Acquire -> read one frame -> Ack -> return fd.
+            // Deny { reason } -> Err(Denied).
+        pub fn start_event_loop(&mut self, render_tx: &mpsc::Sender<RenderCmd>);
+            // BLOCKING loop on the app thread until the connection ends:
+            //   Revoke {resources} -> send RenderCmd::Stop to render,
+            //                        reply Release (the revoke-ack; the
+            //                        server waits <=5s for it)
+            //   Grant + fd         -> send Ack (5s server timer), send
+            //                        RenderCmd::Draw(fd) to render
+            //   EOF/error          -> send Stop, return ("connection lost")
+    }
 
-| phase | objective | state |
-| ----- | --------- | ----- |
-| 1 | scaffold crate, Rust-idiomatic API shape | committed (`9604925`) |
-| 2 | connect + Advertise + reader thread + RAII Drop (shutdown(2) + join) | **implemented, uncommitted — awaiting review gate** |
-| 3 | `acquire` (blocking request/reply) + auto-`Ack` | pending |
-| 4 | `release` + held-resource tracking | pending |
-| 5 | `Revoke` event + auto revoke-ack `Release` + re-grant (`Granted { fd }` event) | pending |
-| 6 | test matrix + docs | pending |
-| 7 | demo client refactor (`sgc-fbdev-client` onto the lib) | pending |
+`comm.rs` is folded into `client.rs` (`read_framed` is a private fn).
+`RenderCmd` lives in the app's render module:
 
-Workflow: one phase per commit, `cargo check`/`cargo test -p libsgc-rs` green
-per commit, diff shown to the user before committing.
+    pub enum RenderCmd {
+        Draw(OwnedFd),   // a grant (initial or re-grant): draw with this fd
+        Stop,            // revoked: stop rendering and drop the granted fd
+    }
 
-## Threading model
+## App structure (the reference shape, from the demos)
 
-```
-app/main thread                            reader thread ("sgc-reader", blocking)
-acquire():                                  loop:
-  lock request mutex                          blocking recvmsg one frame
-  write Acquire (write mutex, one frame)        Grant  -> resolve pending /
-  block on reply channel                                 fire Granted{fd},
-  -> Ok(fd) | Err(Denied)                              auto-Ack
-release():                                    Deny   -> fail pending acquire
-  check held, write Release                   Revoke -> auto-Release (revoke-ack),
-  -> returns once written                               fire Revoked
-event loop:                                  EOF    -> fail pending, mark dead,
-  drain Receiver<SgcEvent>                            exit
-Drop: shutdown(2) -> reader EOF -> join
-```
+- main thread: connect → check advertised resources → acquire (blocking)
+  → spawn render task → send the granted fd as the first `Draw` → run
+  `client.start_event_loop(&render_tx)` → send `Stop`, drop the sender,
+  join the render task.
+- render task (separate thread): receives `RenderCmd::Draw(OwnedFd)` /
+  `Stop` through an mpsc channel; owns the granted fd (drops it on
+  `Stop`); redraws its cached scene on every `Draw`.
+- The demos render until killed: no `--hold` flag, no graceful release —
+  the server frees the resource on our disconnect when the process dies.
 
-- Inbound is the reader thread's whole job. It owns the socket for READING
-  (the stream moved into `reader_main`).
-- Outbound is written through a shared `Mutex<UnixStream>` (a `try_clone` of
-  the same socket): the app writes `Acquire`/`Release`, the reader writes
-  `Ack` and the revoke-ack `Release`. The mutex is held ONLY for the duration
-  of one write — never while waiting on a reply (or the reader's revoke-ack
-  write would deadlock behind a blocked `acquire`).
-- Teardown: last `SgcClient` clone's `Drop` calls `shutdown(2)` on a socket
-  clone -> the reader's blocking read returns EOF -> thread exits -> join.
-  No poll, no pipe, no command channel.
-- Blocking is per-call on the CALLING thread; the library's own threads
-  never block on the app.
+## Render task / renderer constraints (linfb)
 
-## Shared state (`ClientInner`)
+- linfb's `Compositor` is `!Send` (holds `Box<dyn Shape>`), so the
+  Renderer CANNOT be built in main and moved into the thread — create it
+  INSIDE the render task from the first granted fd. (Compositor is an
+  owned struct — `compositor(&self, bg) -> Compositor`, no lifetime — so
+  it stores fine next to the Framebuffer; it just can't cross threads.)
+- linfb's `Framebuffer::open_with_fd` TAKES OWNERSHIP of the fd
+  (`File::from_raw_fd`, closes on drop) — hand it a `dup`
+  (`OwnedFd::try_clone`), keep the granted OwnedFd as single owner.
+  OwnedFd's IO-safety check aborts on double close; the old
+  `unsafe from_raw_fd` demo silently double-closed.
+- Create the Renderer ONCE per app run and KEEP it across revokes: the
+  fbdev mmap stays valid after the granted fd closes (mmap holds the file
+  description) and the device is the same, so a revoked-then-regranted
+  cycle just redraws. `Stop` drops the granted OwnedFd only; the renderer
+  is dropped when the task ends (channel closed = main gone).
+- Opening (ioctls + mmap) and building the scene (font loading) are the
+  expensive parts — that is why they happen exactly once. Redrawing the
+  same static compositor is idempotent (it covers the whole screen with
+  its background), so a redraw is just draw + flush.
 
-| field | type | written by | purpose |
-| ----- | ---- | ---------- | ------- |
-| `shutdown` | `UnixStream` (clone) | — | `Drop` unblocks the reader via shutdown(2) |
-| `join` | `Mutex<Option<JoinHandle<()>>>` | `Drop` | last clone joins the reader |
-| `write` | `Mutex<UnixStream>` (clone) | app + reader | all outbound frames (one write per lock) |
-| `request` | `Mutex<()>` | app | serializes `acquire()`: ONE outstanding acquire |
-| `pending` | `Mutex<Option<oneshot::Sender<Result<OwnedFd, SgcError>>>>` | app + reader | the blocked `acquire()`'s reply channel |
-| `held` | `Mutex<HashSet<Resource>>` | app + reader | what this session owns (gates `release`, revoke-ack) |
-| `dead` | `AtomicBool` | reader | set on reader exit; `acquire`/`release` fail fast with `HandlePoisoned` |
-| `events` | `mpsc::Sender<SgcEvent>` | reader | lives in `reader_main` (already wired) |
+## Wire mechanics (unchanged, apply to any client)
 
-`acquire()` holds `request` across the WHOLE call (lock -> write -> reply
-wait): the reply channel is a single slot, so only one acquire may be in
-flight. The `write` mutex is only taken for each individual frame.
-
-## Reader dispatch
-
-`reader_main` loop, per received message:
-
-| server message | action |
-| -------------- | ------ |
-| `Grant { resources }` + fds | validate `fds.len() == resources.len()` (violation = fatal: log, mark dead, exit). Convert the fd to `OwnedFd` (safe `OwnedFd::try_from` — never the demo client's `unsafe from_raw_fd`). If `pending` is set: resolve it with `Ok(fd)` — the blocked `acquire()` returns, NO event. Else the grant is the unsolicited re-grant after revoke: fire `SgcEvent::Granted { resource, fd }`. Then `held.insert` and send `Ack` (library auto-acks — the app never sees the wire). |
-| `Deny { reason }` | if `pending` set -> resolve with `Err(Denied { reason })`; else log warn (unexpected) |
-| `Revoke { resources }` | per resource: if in `held` -> remove, send `Release` (the revoke-ack; server is waiting inside `REVOKE_TIMEOUT`), then fire `SgcEvent::Revoked`. If NOT held -> log warn, no `Release` (nothing to release; a stray Release just makes server-side noise) |
-| `Advertise { .. }` | duplicate (server sends only on connect) -> log warn, ignore |
-| other / unparseable | log error, ignore (forward compat) |
-
-Protocol violations (fd-count mismatch, grant for a resource nobody asked
-for) are fatal: log error, mark dead, exit the reader. Staying connected to
-a corrupting server is worse than a loud failure.
-
-Reader exit path: fail `pending` if set (drop the sender — the blocked
-`acquire()`'s `recv()` errors and maps to `HandlePoisoned`), mark `dead`,
-drop the `events` sender (the app's `recv()` returns `Err(Disconnected)` =
-"session over"), exit.
-
-## API semantics
-
-```
-pub fn acquire(&self, resource: Resource) -> Result<OwnedFd, SgcError>   // blocks
-pub fn release(&self, resource: Resource) -> Result<(), SgcError>
-```
-
-### acquire()
-
-BLOCKING request/reply. The ONE request call: app startup (or again after a
-voluntary `release()`). A re-grant after revoke does NOT go through
-`acquire()` — the server hands the resource back unsolicited and the fresh
-fd arrives inside `SgcEvent::Granted`.
-
-1. Lock `request` (serializes concurrent callers; second thread waits).
-2. Create a `oneshot`, stash the sender in `pending`, write
-   `Acquire { resources: [resource] }` (write mutex, one write), then block
-   on the reply:
-   - `Grant` -> `Ok(OwnedFd)`
-   - `Deny` -> `Err(Denied { reason })` (e.g. first-owner policy, or
-     "already owned by this client")
-   - reader died -> `Err(HandlePoisoned)`
-   - queued: the server sends NO reply; the `Grant` arrives later (via the
-     engine's control channel) and resolves the pending acquire exactly like
-     an immediate grant. The blocked caller cannot tell "queued then
-     granted" from "granted immediately" — which is the point.
-3. Blocks indefinitely (v1). A future `acquire_timeout` is trivial: the
-   reply is a channel, so `recv_timeout` is a one-liner. Do not build the
-   timeout in now.
-
-Deliberately NOT pre-checking `held` (the server's "already owned" Deny is
-the single source of truth — no local state drift).
-
-### release()
-
-Voluntary hand-back. Check `held`: not held -> `Err(ResourceNotHeld { resource })`
-(also covers "revoke already disowned it for me" — the reader removed it
-from `held` when it sent the revoke-ack, so a double `Release` never hits
-the wire). Otherwise write `Release { resources: [resource] }`, remove from
-`held`, return `Ok(())`. The server sends no reply, so "blocking" means
-"returns once the frame is written".
-
-`release()` is for VOLUNTARY hand-back. On `Revoke` the library already sent
-the `Release` on the app's behalf; the app's job is only to drop the
-`OwnedFd` and stop drawing.
-
-### Events
-
-- `Granted { resource, fd }` — the server re-granted the resource after
-  revoking us (we were requeued). The fresh fd is IN the event: start
-  drawing with it immediately — no `acquire` call. Only fires when no
-  `acquire` is in flight: a grant that answers a pending `acquire` is
-  returned directly by that call. The protocol `Ack` was already sent.
-  `SgcEvent` is `Debug`-only (it carries `OwnedFd`, which is
-  `!Clone`/`!PartialEq`).
-- `Revoked { resource }` — drop the fd, stop drawing. The revoke-ack
-  `Release` was already sent; the resource is disowned.
-
-### Drop
-
-As in phase 2. Last clone: `shutdown(2)`, join. The reader's exit path fails
-`pending` and marks `dead`; nothing else to do. Panic in the reader is
-tolerated (join result ignored; a blocked `acquire` still wakes via the
-dropped channel).
+- Every read is recvmsg (`sendfd::RecvWithFd`) — fds attach to the first
+  bytes of a Grant frame; a plain read silently discards them. Header read
+  included.
+- Convert SCM_RIGHTS fds with `unsafe { OwnedFd::from_raw_fd(fd) }`
+  (sound: ownership transfers; there is NO safe `TryFrom<RawFd>` for
+  OwnedFd).
+- Ack after every Grant (the server arms a 5s ack timer on every grant —
+  the initial grant AND the unsolicited regrant). Release on Revoke is
+  the revoke-ack (server force-reclaims after 5s and does NOT requeue).
+- Regrant arrives unsolicited (no preceding Acquire) — that is the normal
+  preemption handoff; the client just Acks and hands the fd on.
 
 ## Error mapping
+
+`SgcError` (thiserror, 5 variants — no anyhow in the public API):
 
 | site | variant |
 | ---- | ------- |
 | connect: no server / refused | `ConnectFailed(io)` |
 | connect: bad frame or non-`Advertise` first message | `Protocol` / `UnexpectedMessage` |
 | acquire: server deny | `Denied { reason }` |
-| acquire: reader died while waiting | `HandlePoisoned` |
-| acquire/release after reader death | `HandlePoisoned` |
-| acquire/release: wire write failure | `Io` |
-| release: not held | `ResourceNotHeld { resource }` |
+| acquire: grant without exactly 1 fd | `Io(InvalidData)` |
+| acquire/event loop: wire write/read failure | `Io` |
 | any: frame decode | `Protocol` |
 
-No `anyhow` in the public API (thiserror only, already the case).
+EOF inside the event loop is normal teardown ("connection lost"), not an
+error the app must handle.
 
-## Phase plan
+## Status
 
-### Phase 3 — acquire (blocking request/reply) + auto-Ack
+The design is FINAL and board-verified (see the intro). What remains is
+the mechanical extraction:
 
-- `ClientInner`: add `write`, `request`, `pending`, `held`, `dead`.
-- `reader_main`: dispatch `Grant` (resolve pending with the fd, auto-Ack; no
-  pending -> warn + close the fds so nothing leaks) and `Deny` (fail
-  pending); mark `dead` on exit.
-- `SgcClient::acquire` implemented per above.
-- Tests (fake-server pattern, readiness handshake via `sync_channel(0)`):
-  - acquire granted immediately -> `Ok(fd)`, server observed the auto-`Ack`
-  - acquire denied -> `Err(Denied { reason })`
-  - server dies while acquire waits -> `Err(HandlePoisoned)`
-  - two threads racing `acquire` -> serialized (request mutex), both
-    eventually served
-  - unsolicited `Grant` with no pending -> fds closed, no leak, session
-    stays alive
+| step | objective | state |
+| ---- | --------- | ----- |
+| 1 | validate the design inline in `sgc-fbdev-client` | done — committed (`ac9c601`); verified on the aarch64 board |
+| 2 | sibling demo `sgc-fbdev-client-2` (same client, different scene) | done — committed (`ac9c601`) |
+| 3 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | pending |
+| 4 | rework `libsgc-rs` crate API surface to the final shape above | pending |
+| 5 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | pending |
+| 6 | real-daemon matrix on a test socket (needs `SGC_SOCKET` + `SGC_FBDEV_PATH` knobs on the server) | pending |
+| 7 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | pending |
 
-### Phase 4 — release + held tracking
-
-- `held` maintained by `Grant` (reader) and `release()` (app).
-- `SgcClient::release` implemented per above.
-- Tests:
-  - release ok, server observed `Release`
-  - double release -> `ResourceNotHeld`
-  - release of never-acquired resource -> `ResourceNotHeld`
-
-### Phase 5 — revoke + re-grant
-
-- Reader: `Revoke` -> auto-`Release` + `Revoked` event; unsolicited `Grant`
-  (no pending) -> `Granted { resource, fd }` event.
-- Tests (fake server, full wire fidelity incl. SCM_RIGHTS via `sendfd`):
-  - revoke while holding -> `Revoked` event fired, server observed the
-    auto-`Release`
-  - revoke for a resource not held -> no `Release` on the wire, warn only
-  - re-grant with no pending acquire -> `Granted { fd }` fires, fd usable
-    immediately, and the fake server saw NO second `Acquire` frame
-  - full preemption cycle: acquire -> `Ok(fd)` -> revoke (`Revoked`, drop
-    fd) -> re-grant (`Granted { fd }`, draw again) — the app made exactly
-    one `acquire` call, ever
-
-### Phase 6 — test matrix + docs
-
-- Run the full matrix against the REAL daemon, spawned as a subprocess on a
-  test abstract socket. Requires two small daemon testability knobs (server
-  side, one commit):
-  - `SGC_SOCKET` env: abstract socket name (default `sgc`) — currently
-    hardcoded in `main.rs:71`
-  - `SGC_FBDEV_PATH` env: device path (default `/dev/fb0`) — so a host
-    without fbdev can register `/dev/null` (matches the controller's
-    integration-test trick)
-- Matrix: immediate grant; deny (first-owner); queued grant; preemption
-  handoff (revoke -> auto-release -> regrant); force-reclaim (server
-  revokes, lib silent -> server reclaims, lib survives); server death
-  mid-session (`HandlePoisoned` + event channel disconnect); drop mid-acquire.
-- Docs: this file gains a usage section (short example: connect, acquire,
-  draw, drain events); `docs/README.md` workspace table gains `libsgc-rs`;
-  root `README.md` links stay minimal.
-
-### Phase 7 — demo client refactor
-
-- `sgc-fbdev-client` drops raw protocol handling AND tokio: use
-  `SgcClient::connect` + event receiver + `acquire`/`release`. `linfb`
-  drawing stays.
-- Main loop: `fd = acquire()` once -> draw -> drain events: `Granted { fd }`
-  draws with the new fd, `Revoked` stops rendering; `--hold` keeps looping,
-  ctrl-c releases and exits.
-- Removes `tokio`, `sendfd`, `rmp-serde` (transitively) from the demo
-  client's dependency tree.
+Workflow: one step per commit, `cargo check`/`cargo test -p libsgc-rs`
+green per commit, diff shown to the user before committing.
 
 ## Explicit non-goals (v1)
 
 - Multi-resource `acquire` (server denies it anyway; revisit with the
   server).
-- Acquire timeout (future `acquire_timeout`, one-liner on the reply
-  channel).
-- Non-blocking `acquire` (an app that must not block its main thread calls
-  `acquire()` from a worker thread; the library itself never blocks its
-  reader thread).
+- Acquire timeout (a future `acquire_timeout` is a one-liner — the reply
+  is a direct read; do not build it in now).
+- Non-blocking `acquire` (an app that must not block its main thread runs
+  the client on a worker thread; the client itself never blocks anything
+  else).
 - Reconnect logic (session dies loudly; the app reconnects).
 - The C client library (LVGL) — a later crate; the wire spec it needs is
   already in `docs/PROTOCOL.md`.
