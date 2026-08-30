@@ -842,12 +842,20 @@ dependencies = [
 name = "sgc-fbdev-client"
 version = "0.1.0"
 dependencies = [
- "libc",
  "linfb",
- "nix 0.29.0",
  "sendfd",
  "simple-graphics-protocol",
- "tokio",
+ "thiserror",
+]
+
+[[package]]
+name = "sgc-fbdev-client-2"
+version = "0.1.0"
+dependencies = [
+ "linfb",
+ "sendfd",
+ "simple-graphics-protocol",
+ "thiserror",
 ]
 
 [[package]]
