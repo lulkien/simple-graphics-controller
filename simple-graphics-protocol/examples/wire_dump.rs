@@ -1,5 +1,5 @@
 use simple_graphics_protocol::{
-    ClientRequest, Resource, DisplayResource, ServerMessage, serialize, serialize_framed,
+    ClientRequest, Resource, ServerMessage, serialize, serialize_framed,
 };
 
 fn main() {
@@ -7,32 +7,29 @@ fn main() {
         (
             "Acquire{Fbdev}".into(),
             serialize(&ClientRequest::Acquire {
-                resource: Resource::Display(DisplayResource::Fbdev),
+                resource: Resource::Fbdev,
             })
             .unwrap(),
         ),
         (
             "Release{Fbdev}".into(),
             serialize(&ClientRequest::Release {
-                resource: Resource::Display(DisplayResource::Fbdev),
+                resource: Resource::Fbdev,
             })
             .unwrap(),
         ),
-        (
-            "Ack".into(),
-            serialize(&ClientRequest::Ack).unwrap(),
-        ),
+        ("Ack".into(), serialize(&ClientRequest::Ack).unwrap()),
         (
             "Advertise{[Fbdev]}".into(),
             serialize(&ServerMessage::Advertise {
-                available_resources: vec![Resource::Display(DisplayResource::Fbdev)],
+                available_resources: vec![Resource::Fbdev],
             })
             .unwrap(),
         ),
         (
             "Grant{Fbdev}".into(),
             serialize(&ServerMessage::Grant {
-                resource: Resource::Display(DisplayResource::Fbdev),
+                resource: Resource::Fbdev,
             })
             .unwrap(),
         ),
@@ -49,13 +46,17 @@ fn main() {
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(payload);
-        println!("{name:20} payload len={:3}  {}", payload.len(), hex(payload));
+        println!(
+            "{name:20} payload len={:3}  {}",
+            payload.len(),
+            hex(payload)
+        );
         println!("{name:20} framed  len={:3}  {}", framed.len(), hex(&framed));
     }
 
     // Sanity: serialize_framed produces the same bytes as manual framing.
     let framed = serialize_framed(&ServerMessage::Grant {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .unwrap();
     let mut manual = Vec::with_capacity(4 + cases[4].1.len());

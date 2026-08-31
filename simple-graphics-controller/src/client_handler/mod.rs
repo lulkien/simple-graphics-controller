@@ -12,7 +12,8 @@ mod wire;
 use std::{sync::Arc, time::Duration};
 
 use crate::error::{ServerError, ServerResult};
-use crate::types::{ClientId, ResourceRegistry};
+use crate::resource_manager::ResourceRegistries;
+use crate::types::ClientId;
 use crate::windowing::PolicyEngine;
 use nix::libc::pid_t;
 use simple_graphics_protocol::{Resource, ServerMessage, serialize_framed};
@@ -29,7 +30,7 @@ pub async fn handle_connection(
     client_id: ClientId,
     client_pid: pid_t,
     engine: PolicyEngine,
-    resource_reg: ResourceRegistry,
+    registries: ResourceRegistries,
     advertised: Arc<Vec<Resource>>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] New client connected");
@@ -69,7 +70,7 @@ pub async fn handle_connection(
                         client_id,
                         client_pid,
                         &engine,
-                        &resource_reg,
+                        &registries,
                         &mut ack_deadline,
                     ).await? {
                         break;
@@ -82,7 +83,7 @@ pub async fn handle_connection(
                         client_id,
                         client_pid,
                         msg,
-                        &resource_reg,
+                        &registries,
                         &mut ack_deadline,
                     ).await?;
                 }

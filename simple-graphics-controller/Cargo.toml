@@ -14,6 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0.104"
 thiserror = "1"
 evdev = "0.12"
+drm = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

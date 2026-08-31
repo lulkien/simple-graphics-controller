@@ -20,8 +20,8 @@ use dashmap::DashMap;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use sendfd::RecvWithFd;
 use simple_graphics_protocol::{
-    ClientRequest, DisplayResource, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize,
-    parse_frame_header, serialize_framed,
+    ClientRequest, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize, parse_frame_header,
+    serialize_framed,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -30,6 +30,7 @@ use tokio::{
 
 use crate::{
     client_handler::handle_connection,
+    resource_manager::ResourceRegistries,
     types::{ClientId, ResourceRegistry},
     windowing::{Policy, PolicyEngine, REVOKE_TIMEOUT},
 };
@@ -164,13 +165,15 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
     // A /dev/null fd stands in for the fbdev fd (hosts lack /dev/fb0).
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     let file = std::fs::File::open("/dev/null").expect("/dev/null");
-    resource_reg.insert(Resource::Display(DisplayResource::Fbdev), file.into());
-    let advertised = Arc::new(vec![Resource::Display(DisplayResource::Fbdev)]);
+    resource_reg.insert(Resource::Fbdev, file.into());
+    // No DRM cards on test hosts; the lease registry stays empty.
+    let registries = ResourceRegistries {
+        fds: resource_reg,
+        drm: Arc::new(DashMap::new()),
+    };
+    let advertised = Arc::new(vec![Resource::Fbdev]);
 
-    let engine = PolicyEngine::spawn(std::collections::HashMap::from([(
-        Resource::Display(DisplayResource::Fbdev),
-        policy,
-    )]));
+    let engine = PolicyEngine::spawn(std::collections::HashMap::from([(Resource::Fbdev, policy)]));
 
     let addr = StdSocketAddr::from_abstract_name(name).expect("invalid abstract address");
     let std_listener = StdUnixListener::bind_addr(&addr).expect("bind");
@@ -189,7 +192,7 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
             let creds = getsockopt(&stream, PeerCredentials).expect("peer credentials");
             let client_id = ClientId::new(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
             let engine = engine.clone();
-            let resource_reg = resource_reg.clone();
+            let registries = registries.clone();
             let advertised = advertised.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(
@@ -197,7 +200,7 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
                     client_id,
                     creds.pid(),
                     engine,
-                    resource_reg,
+                    registries,
                     advertised,
                 )
                 .await
@@ -213,12 +216,9 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
 async fn first_client_is_granted() {
     spawn_server(b"sgc-test-1", Policy::FairQueue).await;
     let mut a = TestClient::connect(b"sgc-test-1").await;
-    assert_eq!(
-        a.expect_advertise().await,
-        vec![Resource::Display(DisplayResource::Fbdev)]
-    );
+    assert_eq!(a.expect_advertise().await, vec![Resource::Fbdev]);
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     let fds = a.expect_grant().await;
@@ -234,14 +234,14 @@ async fn second_client_preempts_and_handoff_completes() {
     let _ = b.expect_advertise().await;
 
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
 
     // B acquires -> queued (silence); A is told to leave.
     b.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     b.expect_silence(Duration::from_millis(200)).await;
@@ -249,7 +249,7 @@ async fn second_client_preempts_and_handoff_completes() {
 
     // A's revoke-ack Release hands the resource to B.
     a.send(&ClientRequest::Release {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     b.expect_grant().await;
@@ -264,24 +264,24 @@ async fn revoked_client_is_requeued_for_one_more_turn() {
     let _ = b.expect_advertise().await;
 
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
     b.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_revoke().await;
     a.send(&ClientRequest::Release {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     b.expect_grant().await;
 
     // B releases voluntarily -> A (requeued) gets the unsolicited re-Grant.
     b.send(&ClientRequest::Release {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
@@ -296,12 +296,12 @@ async fn first_owner_denies_new_acquires() {
     let _ = b.expect_advertise().await;
 
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
     b.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     let reason = b.expect_deny().await;
@@ -319,14 +319,14 @@ async fn queued_client_disconnect_does_not_wedge_queue() {
     let _ = c.expect_advertise().await;
 
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
 
     // B queues, then gives up and disconnects.
     b.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_revoke().await;
@@ -334,11 +334,11 @@ async fn queued_client_disconnect_does_not_wedge_queue() {
 
     // A releases; the queue is empty, so C's fresh Acquire is granted.
     a.send(&ClientRequest::Release {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     c.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     c.expect_grant().await;
@@ -353,12 +353,12 @@ async fn silent_owner_is_force_reclaimed_after_timeout() {
     let _ = b.expect_advertise().await;
 
     a.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_grant().await;
     b.send(&ClientRequest::Acquire {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
     })
     .await;
     a.expect_revoke().await;

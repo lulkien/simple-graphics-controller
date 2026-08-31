@@ -397,12 +397,12 @@ fn force_reclaim(
 #[cfg(test)]
 mod engine_tests {
     use super::*;
-    use simple_graphics_protocol::DisplayResource;
+    use simple_graphics_protocol::Resource;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
     fn fbdev() -> Resource {
-        Resource::Display(DisplayResource::Fbdev)
+        Resource::Fbdev
     }
 
     fn cid(n: u64) -> ClientId {

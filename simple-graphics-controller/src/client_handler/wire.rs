@@ -6,8 +6,7 @@
 use std::io::ErrorKind;
 
 use crate::{
-    error::ServerResult,
-    types::{ClientId, ResourceRegistry},
+    error::ServerResult, resource_manager::ResourceRegistries, types::ClientId,
     windowing::PolicyEngine,
 };
 use nix::libc::pid_t;
@@ -26,7 +25,7 @@ pub(super) async fn process_wire_bytes(
     client_id: ClientId,
     client_pid: pid_t,
     engine: &PolicyEngine,
-    resource_reg: &ResourceRegistry,
+    registries: &ResourceRegistries,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<bool> {
     // Drain whatever is available right now (WouldBlock = back to select!).
@@ -66,7 +65,7 @@ pub(super) async fn process_wire_bytes(
             client_id,
             client_pid,
             engine,
-            resource_reg,
+            registries,
             ack_deadline,
         )
         .await?;

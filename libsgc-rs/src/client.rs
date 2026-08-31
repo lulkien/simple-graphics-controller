@@ -77,7 +77,9 @@ impl SgcClient {
             eprintln!("warning: Advertise carried {} unexpected fds", fds.len());
         }
         match msg {
-            ServerMessage::Advertise { available_resources } => {
+            ServerMessage::Advertise {
+                available_resources,
+            } => {
                 println!(
                     "connected to @{}; available: {available_resources:?}",
                     String::from_utf8_lossy(name)
@@ -135,7 +137,9 @@ impl SgcClient {
     pub fn fd(&self, resource: &Resource) -> Result<OwnedFd, SgcError> {
         self.held
             .get(resource)
-            .ok_or_else(|| SgcError::NotHeld { resource: resource.clone() })
+            .ok_or_else(|| SgcError::NotHeld {
+                resource: resource.clone(),
+            })
             .and_then(|fd| fd.try_clone().map_err(SgcError::Io))
     }
 
@@ -254,6 +258,7 @@ fn read_framed(stream: &mut UnixStream) -> Result<(ServerMessage, Vec<RawFd>), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sendfd::SendWithFd;
     use std::{
         io::{Read, Write},
         os::{
@@ -264,8 +269,6 @@ mod tests {
         sync::mpsc,
         thread,
     };
-    use sendfd::SendWithFd;
-    use simple_graphics_protocol::DisplayResource;
 
     /// Minimal fake controller: bind an abstract listener, signal `ready`,
     /// accept one client, send `Advertise`, optionally reply with `reply`
@@ -282,7 +285,7 @@ mod tests {
             ready_tx.send(()).expect("ready signal");
             let (mut stream, _) = listener.accept().expect("accept");
             let adv = serialize_framed(&ServerMessage::Advertise {
-                available_resources: vec![Resource::Display(DisplayResource::Fbdev)],
+                available_resources: vec![Resource::Fbdev],
             })
             .expect("serialize advertise");
             stream.write_all(&adv).expect("write advertise");
@@ -323,7 +326,7 @@ mod tests {
         let (server, ready) = fake_server(b"sgc-test-adv", None);
         ready.recv().expect("server ready");
         let (client, available) = SgcClient::connect_at(b"sgc-test-adv").expect("connect");
-        assert_eq!(available, vec![Resource::Display(DisplayResource::Fbdev)]);
+        assert_eq!(available, vec![Resource::Fbdev]);
         assert!(client.held().is_empty());
         drop(client);
         server.join().expect("server thread finished");
@@ -342,7 +345,7 @@ mod tests {
         );
         ready.recv().expect("server ready");
         let (mut client, _) = SgcClient::connect_at(b"sgc-test-deny").expect("connect");
-        let err = client.acquire(Resource::Display(DisplayResource::Fbdev)).expect_err("must be denied");
+        let err = client.acquire(Resource::Fbdev).expect_err("must be denied");
         assert!(
             matches!(err, SgcError::Denied { ref reason } if reason == "first-owner policy"),
             "expected Denied, got {err:?}"
@@ -359,16 +362,16 @@ mod tests {
             b"sgc-test-grant",
             Some((
                 ServerMessage::Grant {
-                    resource: Resource::Display(DisplayResource::Fbdev),
+                    resource: Resource::Fbdev,
                 },
                 Some(devnull.as_raw_fd()),
             )),
         );
         ready.recv().expect("server ready");
         let (mut client, _) = SgcClient::connect_at(b"sgc-test-grant").expect("connect");
-        client.acquire(Resource::Display(DisplayResource::Fbdev)).expect("grant");
-        assert_eq!(client.held(), vec![Resource::Display(DisplayResource::Fbdev)]);
-        let fd = client.fd(&Resource::Display(DisplayResource::Fbdev)).expect("lend");
+        client.acquire(Resource::Fbdev).expect("grant");
+        assert_eq!(client.held(), vec![Resource::Fbdev]);
+        let fd = client.fd(&Resource::Fbdev).expect("lend");
         assert!(fd.as_raw_fd() >= 0, "lent fd must be valid");
         drop(client);
         server.join().expect("server thread finished");

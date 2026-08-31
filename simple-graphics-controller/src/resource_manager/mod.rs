@@ -19,20 +19,47 @@ use simple_graphics_protocol::Resource;
 use tracing::{error, info};
 
 use crate::types::ResourceRegistry;
+use display::open_drm_devices;
+
+pub use display::DrmRegistry;
+
+/// The server's grant sources, cloned per client connection.
+#[derive(Clone)]
+pub struct ResourceRegistries {
+    /// Static fds for `Fbdev` and `Input` (grants are dups of these).
+    pub fds: ResourceRegistry,
+    /// DRM lease factories: each grant creates a fresh lease fd.
+    pub drm: DrmRegistry,
+}
+
+/// Everything the server opened at startup.
+pub struct OpenedResources {
+    /// The registries the server grants from.
+    pub registries: ResourceRegistries,
+    /// Resources in advertised order (priority order — first is best).
+    pub advertised: Vec<Resource>,
+}
 
 /// Open and register every available resource.
 ///
-/// Returns the registry plus the resources in advertised order (priority
+/// Returns the registries plus the resources in advertised order (priority
 /// order — first is best).
-pub fn query_resource() -> (ResourceRegistry, Vec<Resource>) {
+pub fn query_resource() -> OpenedResources {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
+    let drm_registry: DrmRegistry = Arc::new(DashMap::new());
     let mut advertised = Vec::new();
 
     display::open_fbdev(resource_reg.clone(), &mut advertised);
-    display::open_drm_devices(resource_reg.clone(), &mut advertised);
+    open_drm_devices(drm_registry.clone(), &mut advertised);
     open_input_devices(resource_reg.clone(), &mut advertised);
 
-    (resource_reg, advertised)
+    OpenedResources {
+        registries: ResourceRegistries {
+            fds: resource_reg,
+            drm: drm_registry,
+        },
+        advertised,
+    }
 }
 
 /// Open and register every input device the discovery submodule found. Each

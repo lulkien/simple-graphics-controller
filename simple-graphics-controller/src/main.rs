@@ -32,8 +32,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting simple-graphics-controller");
-    let (resource_reg, advertised) = query_resource();
-    let advertised = Arc::new(advertised);
+    let resources = query_resource();
+    let advertised = Arc::new(resources.advertised);
     debug!("Advertised resources (priority order): {advertised:?}");
 
     // Window policy: SGC_POLICY env, default fair-queue. One policy for all
@@ -46,11 +46,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(Policy::FairQueue);
     info!("Windowing policy: {policy:?}");
 
-    let policies: HashMap<Resource, Policy> = resource_reg
+    // One policy per advertised resource (covers Fbdev, Drm, and Input).
+    let policies: HashMap<Resource, Policy> = advertised
         .iter()
-        .map(|entry| (entry.key().clone(), policy))
+        .cloned()
+        .map(|resource| (resource, policy))
         .collect();
     let engine = PolicyEngine::spawn(policies);
 
-    server::run(engine, resource_reg, advertised).await
+    // `resources` (with the DRM masters inside registries.drm) stays alive
+    // for the whole run: closing a master destroys its leases.
+    server::run(engine, resources.registries, advertised).await
 }

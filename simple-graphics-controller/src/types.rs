@@ -23,6 +23,8 @@ impl std::fmt::Display for ClientId {
     }
 }
 
-/// The server's own fds for each resource. Grants are duplicates of these
-/// (`SCM_RIGHTS`); the server never closes them.
+/// The server's own fds for `Fbdev` and `Input` resources. Grants are
+/// duplicates of these (`SCM_RIGHTS`); the server never closes them. DRM
+/// cards are NOT here — their grants are fresh lease fds created per grant
+/// by the DRM registry (`crate::resource_manager::DrmRegistry`).
 pub type ResourceRegistry = Arc<DashMap<Resource, OwnedFd>>;
