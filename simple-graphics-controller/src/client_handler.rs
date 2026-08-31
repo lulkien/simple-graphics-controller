@@ -1,8 +1,4 @@
-use std::{
-    io::ErrorKind,
-    os::fd::{AsRawFd, RawFd},
-    time::Duration,
-};
+use std::{io::ErrorKind, os::fd::AsRawFd, time::Duration};
 
 use crate::error::{ServerError, ServerResult};
 use crate::types::{ClientId, ResourceRegistry};
@@ -13,12 +9,7 @@ use simple_graphics_protocol::{
     ClientRequest, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize, parse_frame_header,
     serialize_framed,
 };
-use tokio::{
-    io::AsyncWriteExt,
-    net::UnixStream,
-    sync::mpsc,
-    time::Instant,
-};
+use tokio::{io::AsyncWriteExt, net::UnixStream, sync::mpsc, time::Instant};
 use tracing::{debug, info, trace, warn};
 
 /// How long the server waits for a client to acknowledge a Grant before
@@ -49,9 +40,7 @@ pub async fn handle_connection(
         available_resources: available_resources.clone(),
     })?;
     stream.write_all(&res).await.map_err(ServerError::Write)?;
-    debug!(
-        "[client {client_id} (pid {client_pid})] Sent Advertise: {available_resources:?}"
-    );
+    debug!("[client {client_id} (pid {client_pid})] Sent Advertise: {available_resources:?}");
 
     let mut ack_deadline: Option<Instant> = None;
     // Bytes read from the wire but not yet assembled into a complete frame.

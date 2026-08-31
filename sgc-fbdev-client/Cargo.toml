@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 libsgc-rs = { path = "../libsgc-rs" }
 linfb = { git = "https://github.com/lulkien/linfb" }
+libc = "0.2"
