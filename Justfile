@@ -3,8 +3,10 @@
 #   just                     build (dynamic release for the current host)
 #   just build-gnu-aarch64   fully static aarch64 (gnu) build
 #   just build-musl-x86_64   fully static x86_64 musl build
+#   just build-musl-aarch64  fully static aarch64 musl build
 #   just dist-gnu-aarch64    aarch64 build + strip + copy into ./dist
 #   just dist-musl-x86_64    musl build + strip + copy into ./dist
+#   just dist-musl-aarch64   aarch64 musl build + strip + copy into ./dist
 #   just clean               remove ./target and ./dist
 
 # All shipped binaries; the dist recipes copy/strip/file exactly these.
@@ -37,6 +39,12 @@ build-gnu-aarch64:
 build-musl-x86_64:
     cargo build --release --target {{TARGET_MUSL_AMD64}} --workspace
 
+# Fully static aarch64 musl build (musl.cc toolchain via ~/.cargo/bin
+# symlinks). The font -sys crates build vendored sources for musl targets,
+# so no system font libs are needed. Runs on any Alpine aarch64.
+build-musl-aarch64:
+    cargo build --release --target aarch64-unknown-linux-musl --workspace
+
 # Shared dist step: copy the target's release binaries into ./dist, strip
 # them, print what we shipped. Parameterized by target triple + strip tool
 # so both dist recipes stay identical.
@@ -51,6 +59,10 @@ dist-gnu-aarch64: build-gnu-aarch64
 # musl build + strip + copy into ./dist.
 dist-musl-x86_64: build-musl-x86_64
     just dist-copy {{TARGET_MUSL_AMD64}} {{STRIP_MUSL_AMD64}}
+
+# aarch64 musl build + strip + copy into ./dist
+dist-musl-aarch64: build-musl-aarch64
+    just dist-copy aarch64-unknown-linux-musl aarch64-linux-gnu-strip
 
 # Remove local build output.
 clean:
