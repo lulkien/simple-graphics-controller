@@ -1,6 +1,9 @@
 //! The render task: owns the renderer (framebuffer + scene) and the
-//! granted fd. It is driven by [`RenderCmd`] messages from the main
+//! borrowed fd. It is driven by [`RenderCmd`] messages from the main
 //! thread's event loop — the message-passing mechanism between threads.
+//!
+//! The fd arrives as a DUP lent by the client (client-ownership model):
+//! the render task owns its dup until `Stop`, when it drops it.
 
 use std::{os::fd::OwnedFd, sync::mpsc};
 
@@ -8,13 +11,15 @@ use linfb::{
     Compositor, Framebuffer,
     shape::{Caption, Color, FontBuilder, Rectangle, Shape},
 };
+use simple_graphics_protocol::Resource;
 
 /// Commands from the client's event loop to the render task.
 pub enum RenderCmd {
-    /// A grant (initial or re-grant): draw with this fd.
-    Draw(OwnedFd),
-    /// Revoked: stop rendering and drop the granted fd.
-    Stop,
+    /// A grant (initial or re-grant): draw with this fd. Resource-tagged
+    /// so a multi-resource app can route to the right renderer.
+    Draw { resource: Resource, fd: OwnedFd },
+    /// Revoked: stop rendering and drop the borrowed fd.
+    Stop { resource: Resource },
 }
 
 /// The renderer: framebuffer + scene, created ONCE per app run from the
@@ -102,7 +107,7 @@ pub fn run(rx: mpsc::Receiver<RenderCmd>) {
     let mut current: Option<OwnedFd> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            RenderCmd::Draw(fd) => {
+            RenderCmd::Draw { resource, fd } => {
                 if renderer.is_none() {
                     match Renderer::from_fd(&fd) {
                         Ok(renderer_) => renderer = Some(renderer_),
@@ -116,10 +121,11 @@ pub fn run(rx: mpsc::Receiver<RenderCmd>) {
                 if let Some(renderer) = &mut renderer {
                     renderer.draw();
                 }
+                println!("[render] drawing {resource:?}");
             }
-            RenderCmd::Stop => {
-                current.take(); // disown the granted fd
-                println!("[render] stopped");
+            RenderCmd::Stop { resource } => {
+                current.take(); // disown the borrowed fd
+                println!("[render] stopped {resource:?}");
             }
         }
     }

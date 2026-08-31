@@ -140,9 +140,93 @@ disconnect: EOF/error     -> send Stop, return
 - Regrant arrives unsolicited (no preceding Acquire) — that is the normal
   preemption handoff; the client just Acks and hands the fd on.
 
+## Client-ownership model (prototype — `sgc-fbdev-client-2`)
+
+The single-fd design above moves the granted fd to the app; the app owns
+it. That is fine for one resource. With multiple resources the client
+should be the owner of the truth: it holds the granted fds and LENDS them
+out. Prototyped and board-verified in `sgc-fbdev-client-2`; the crate's
+`client.rs` there is the reference implementation.
+
+### Shape
+
+    pub struct SgcClient {
+        stream: UnixStream,
+        held: HashMap<Resource, OwnedFd>,   // canonical fds, client-owned
+    }
+
+    impl SgcClient {
+        pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError>;
+            // write Acquire -> read Grant -> Ack -> store the canonical fd
+            // in `held`. Deny { reason } -> Err(Denied). Nothing is held
+            // on error. acquire() NO LONGER RETURNS the fd — the client
+            // keeps it.
+        pub fn fd(&self, resource: &Resource) -> Result<OwnedFd, SgcError>;
+            // LEND: returns a fresh dup (try_clone) of the held fd. The
+            // borrower owns its dup; the canonical never leaves the client.
+            // Err(NotHeld { resource }) if not held.
+        pub fn held(&self) -> Vec<Resource>;
+            // what this session holds — the client is the single source
+            // of truth for resource ownership.
+        pub fn start_event_loop(&mut self, render_tx: &mpsc::Sender<RenderCmd>);
+            // Revoke {resources} -> drop the canonical from `held`, send
+            // RenderCmd::Stop { resource } (borrower drops its dup), reply
+            // Release (revoke-ack).
+            // Grant (unsolicited re-grant) -> Ack, store the new canonical,
+            // send RenderCmd::Draw { resource, fd: dup } (fresh lend).
+            // Disconnect -> disown everything (drop canonicals + Stop each
+            // borrower), return.
+    }
+
+    pub enum RenderCmd {                       // resource-tagged for multi-resource apps
+        Draw { resource: Resource, fd: OwnedFd },
+        Stop { resource: Resource },
+    }
+
+### The rules (why it is sound)
+
+1. **The canonical fd never leaves the client.** `fd()` is the only path
+   and it always dups. Then two owners of the same `OwnedFd` are
+   impossible by construction — no double close, no abort.
+2. **Borrowers own their dups.** The render task keeps its dup until
+   `Stop`, then drops it. The client's canonical is dropped at the same
+   time (revoke) — both refer to the same file description, so each side
+   closing its own fd is correct.
+3. **Revoke reaches the borrower.** The event loop sends a tagged `Stop`
+   so the right borrower drops the right dup. With one render channel the
+   tag is the routing key; a multi-resource app can hold per-resource
+   renderers.
+4. **Cleanup is guaranteed.** Disconnect disowns everything the client
+   holds — the library cannot leak a resource the app forgot about (the
+   single-fd design relies on the app dropping its fd).
+
+### Test evidence (board, real `/dev/fb0`, FairQueue policy)
+
+```
+A: granted Fbdev (client holds fd) -> held: [Fbdev] -> [render] drawing
+B preempts A -> A: revoked Fbdev -> [render] stopped Fbdev
+B dies       -> A: re-granted Fbdev -> [render] drawing Fbdev   (fresh dup)
+```
+
+`held` reflected the true state at every step; revoke dropped the
+canonical; the re-grant lent a fresh dup and the renderer (kept across the
+revoke, mmap still valid) redrew. No fd leaks, no double-close.
+
+### Status / open questions
+
+- Prototyped in the demo crate only; `sgc-fbdev-client` keeps the
+  move-based design (both committed in `ac9c601`; the ownership rework is
+  the current uncommitted change in `sgc-fbdev-client-2`).
+- `release()` (voluntary hand-back) is not implemented — the demos render
+  until killed and never release. When it lands: check `held`, write
+  `Release`, remove from `held`.
+- Multi-resource acquisition is still one resource at a time (the server
+  denies multi-resource Acquire anyway); the `HashMap` + tagged `RenderCmd`
+  are the routing for when that changes.
+
 ## Error mapping
 
-`SgcError` (thiserror, 5 variants — no anyhow in the public API):
+`SgcError` (thiserror, 6 variants — no anyhow in the public API):
 
 | site | variant |
 | ---- | ------- |
@@ -152,6 +236,7 @@ disconnect: EOF/error     -> send Stop, return
 | acquire: grant without exactly 1 fd | `Io(InvalidData)` |
 | acquire/event loop: wire write/read failure | `Io` |
 | any: frame decode | `Protocol` |
+| lend (`fd()`) of a resource not held | `NotHeld { resource }` |
 
 EOF inside the event loop is normal teardown ("connection lost"), not an
 error the app must handle.
@@ -165,11 +250,12 @@ the mechanical extraction:
 | ---- | --------- | ----- |
 | 1 | validate the design inline in `sgc-fbdev-client` | done — committed (`ac9c601`); verified on the aarch64 board |
 | 2 | sibling demo `sgc-fbdev-client-2` (same client, different scene) | done — committed (`ac9c601`) |
-| 3 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | pending |
-| 4 | rework `libsgc-rs` crate API surface to the final shape above | pending |
-| 5 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | pending |
-| 6 | real-daemon matrix on a test socket (needs `SGC_SOCKET` + `SGC_FBDEV_PATH` knobs on the server) | pending |
-| 7 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | pending |
+| 3 | ownership-model prototype in `sgc-fbdev-client-2` (client holds fds, `fd()` lends dups, tagged `RenderCmd`) | implemented + board-verified (uncommitted) |
+| 4 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | pending |
+| 5 | rework `libsgc-rs` crate API surface to the final shape above | pending |
+| 6 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | pending |
+| 7 | real-daemon matrix on a test socket (needs `SGC_SOCKET` + `SGC_FBDEV_PATH` knobs on the server) | pending |
+| 8 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | pending |
 
 Workflow: one step per commit, `cargo check`/`cargo test -p libsgc-rs`
 green per commit, diff shown to the user before committing.
