@@ -1,154 +1,36 @@
 # libsgc-rs — client library design
 
 Rust client library for `simple-graphics-controller` (`@sgc`). Apps link the
-crate and drive a `SgcClient`; the client is a PLAIN SYNCHRONOUS wrapper
-over the stream — one struct, one field, driven by ONE app thread. No
-reader thread, no mutexes, no internal channels, no Drop impl.
+crate and drive a `SgcClient`: a synchronous wrapper over the socket — one
+struct, two fields, driven by ONE app thread.
 
-This design is validated end-to-end in `sgc-fbdev-client` and
-`sgc-fbdev-client-2` (identical architecture, different scenes): connect,
-acquire, full preemption cycle (A holds → B preempts → A revoked with auto
-revoke-ack → B granted → server requeues A → A re-granted → draws again)
-on host + aarch64 board with a real `/dev/fb0`. libsgc-rs is the
-extraction of that validated client code.
+The client OWNS the granted fds (one canonical per resource) and LENDS dups to
+the app; the canonical is dropped on revoke or disconnect, so the library
+cannot leak a resource the app forgot about.
 
-## The one decision: no reader thread
+Validated end-to-end in the `sgc-fbdev-client` and `sgc-fbdev-client-2` demos
+(same architecture, different scenes), both linked against this crate:
+connect, acquire, full preemption cycle on host + aarch64 board with a real
+`/dev/fb0`.
 
-The threaded design (background "sgc-reader" thread + shared-state struct +
-event receiver) was rejected as over-complicated. The final shape:
+## Single-threaded by design
 
-    pub struct SgcClient { stream: UnixStream }
+The app thread is always on the socket when it matters: blocked in
+`acquire()` it is not the owner yet (the server only revokes owners), and
+blocked in `start_event_loop()` it is always listening, so the server's 5s
+revoke/ack deadlines are met. An app that must do other work while holding the
+resource runs the client on its own thread — like the demo's main thread next
+to the render thread.
 
-Why this is sound: the app thread is ALWAYS on the socket when it matters —
-blocked in `acquire()` it is not the owner yet (the server only revokes
-owners, so no Revoke can target a queued acquirer), and blocked in
-`start_event_loop()` it is always listening, so the server's 5s
-revoke/ack deadlines are met. An app that must do other work while holding
-the resource runs this client on its own thread — exactly like the demo's
-main thread does next to the render thread.
+Contract: while holding the resource, the client's thread must stay in the
+event loop.
 
-Contract (stated once): while holding the resource, the client's thread
-must stay in the event loop.
+## Client-ownership model
 
-## Usage model (the app's view)
+The client is the source of truth for resource ownership: it holds the granted
+fds and lends them out. The app never touches the canonical fd.
 
-```
-app start -> SgcClient::connect()                 connect + read Advertise
-             fd = client.acquire(Fbdev)?          BLOCKS until the server
-                                                  answers (queued requests
-                                                  block here too)
-             Ok(fd)       -> spawn render task, send it the fd
-             Err(Denied)  -> not allowed; give up (or retry later)
-             client.start_event_loop(&render_tx)  BLOCKS until the
-                                                  connection ends; drives
-                                                  the render task
-revoked:    wire Revoke   -> send RenderCmd::Stop, reply Release
-                             (the revoke-ack — resource disowned)
-regranted:  wire Grant+fd -> send Ack, send RenderCmd::Draw(fd) — no
-                             acquire needed
-disconnect: EOF/error     -> send Stop, return
-```
-
-- `acquire()` BLOCKS the calling thread until the outcome is known:
-  `Ok(fd)` = you may use the resource, `Err(Denied)` = you may not.
-  Queued requests are indistinguishable from immediate grants — the
-  blocked caller cannot tell "queued then granted" from "granted
-  immediately", which is the point.
-- Re-grant after revoke is a WIRE `Grant` handled inside the event loop
-  (mapped to `RenderCmd::Draw(fd)`), not an `acquire()` result: the
-  server handed the resource back on its own. `acquire()` is only for
-  requesting (startup).
-- There is NO event enum: the client maps wire messages straight to the
-  app's command type (`RenderCmd`). Demo-internal coupling is fine; the
-  lib extraction decides later whether to generalize.
-
-## API (final shape)
-
-    pub struct SgcClient { stream: UnixStream }   // single field, NOT Clone, &mut self
-
-    impl SgcClient {
-        pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
-            // connect + read Advertise; returns the advertised list so the
-            // app can fail fast ("server does not offer Fbdev") instead of
-            // eating a Deny round trip.
-        pub fn acquire(&mut self, Resource) -> Result<OwnedFd, SgcError>;
-            // write Acquire -> read one frame -> Ack -> return fd.
-            // Deny { reason } -> Err(Denied).
-        pub fn start_event_loop(&mut self, render_tx: &mpsc::Sender<RenderCmd>);
-            // BLOCKING loop on the app thread until the connection ends:
-            //   Revoke {resources} -> send RenderCmd::Stop to render,
-            //                        reply Release (the revoke-ack; the
-            //                        server waits <=5s for it)
-            //   Grant + fd         -> send Ack (5s server timer), send
-            //                        RenderCmd::Draw(fd) to render
-            //   EOF/error          -> send Stop, return ("connection lost")
-    }
-
-`comm.rs` is folded into `client.rs` (`read_framed` is a private fn).
-`RenderCmd` lives in the app's render module:
-
-    pub enum RenderCmd {
-        Draw(OwnedFd),   // a grant (initial or re-grant): draw with this fd
-        Stop,            // revoked: stop rendering and drop the granted fd
-    }
-
-## App structure (the reference shape, from the demos)
-
-- main thread: connect → check advertised resources → acquire (blocking)
-  → spawn render task → send the granted fd as the first `Draw` → run
-  `client.start_event_loop(&render_tx)` → send `Stop`, drop the sender,
-  join the render task.
-- render task (separate thread): receives `RenderCmd::Draw(OwnedFd)` /
-  `Stop` through an mpsc channel; owns the granted fd (drops it on
-  `Stop`); redraws its cached scene on every `Draw`.
-- The demos render until killed: no `--hold` flag, no graceful release —
-  the server frees the resource on our disconnect when the process dies.
-
-## Render task / renderer constraints (linfb)
-
-- linfb's `Compositor` is `!Send` (holds `Box<dyn Shape>`), so the
-  Renderer CANNOT be built in main and moved into the thread — create it
-  INSIDE the render task from the first granted fd. (Compositor is an
-  owned struct — `compositor(&self, bg) -> Compositor`, no lifetime — so
-  it stores fine next to the Framebuffer; it just can't cross threads.)
-- linfb's `Framebuffer::open_with_fd` TAKES OWNERSHIP of the fd
-  (`File::from_raw_fd`, closes on drop) — hand it a `dup`
-  (`OwnedFd::try_clone`), keep the granted OwnedFd as single owner.
-  OwnedFd's IO-safety check aborts on double close; the old
-  `unsafe from_raw_fd` demo silently double-closed.
-- Create the Renderer ONCE per app run and KEEP it across revokes: the
-  fbdev mmap stays valid after the granted fd closes (mmap holds the file
-  description) and the device is the same, so a revoked-then-regranted
-  cycle just redraws. `Stop` drops the granted OwnedFd only; the renderer
-  is dropped when the task ends (channel closed = main gone).
-- Opening (ioctls + mmap) and building the scene (font loading) are the
-  expensive parts — that is why they happen exactly once. Redrawing the
-  same static compositor is idempotent (it covers the whole screen with
-  its background), so a redraw is just draw + flush.
-
-## Wire mechanics (unchanged, apply to any client)
-
-- Every read is recvmsg (`sendfd::RecvWithFd`) — fds attach to the first
-  bytes of a Grant frame; a plain read silently discards them. Header read
-  included.
-- Convert SCM_RIGHTS fds with `unsafe { OwnedFd::from_raw_fd(fd) }`
-  (sound: ownership transfers; there is NO safe `TryFrom<RawFd>` for
-  OwnedFd).
-- Ack after every Grant (the server arms a 5s ack timer on every grant —
-  the initial grant AND the unsolicited regrant). Release on Revoke is
-  the revoke-ack (server force-reclaims after 5s and does NOT requeue).
-- Regrant arrives unsolicited (no preceding Acquire) — that is the normal
-  preemption handoff; the client just Acks and hands the fd on.
-
-## Client-ownership model (prototype — `sgc-fbdev-client-2`)
-
-The single-fd design above moves the granted fd to the app; the app owns
-it. That is fine for one resource. With multiple resources the client
-should be the owner of the truth: it holds the granted fds and LENDS them
-out. Prototyped and board-verified in `sgc-fbdev-client-2`; the crate's
-`client.rs` there is the reference implementation.
-
-### Shape
+### API
 
     pub struct SgcClient {
         stream: UnixStream,
@@ -156,119 +38,174 @@ out. Prototyped and board-verified in `sgc-fbdev-client-2`; the crate's
     }
 
     impl SgcClient {
+        pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
+            // connect + read Advertise; the advertised list lets the app
+            // fail fast ("server does not offer Fbdev") without a Deny round trip.
         pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError>;
-            // write Acquire -> read Grant -> Ack -> store the canonical fd
-            // in `held`. Deny { reason } -> Err(Denied). Nothing is held
-            // on error. acquire() NO LONGER RETURNS the fd — the client
-            // keeps it.
+            // write Acquire -> read Grant -> Ack -> store the canonical in `held`.
+            // Deny { reason } -> Err(Denied). Nothing held on error. The fd
+            // is NOT returned — the client keeps it.
         pub fn fd(&self, resource: &Resource) -> Result<OwnedFd, SgcError>;
-            // LEND: returns a fresh dup (try_clone) of the held fd. The
-            // borrower owns its dup; the canonical never leaves the client.
-            // Err(NotHeld { resource }) if not held.
+            // LEND: fresh dup (try_clone) of the held fd. Err(NotHeld) if not held.
         pub fn held(&self) -> Vec<Resource>;
-            // what this session holds — the client is the single source
-            // of truth for resource ownership.
-        pub fn start_event_loop(&mut self, render_tx: &mpsc::Sender<RenderCmd>);
-            // Revoke {resources} -> drop the canonical from `held`, send
-            // RenderCmd::Stop { resource } (borrower drops its dup), reply
-            // Release (revoke-ack).
-            // Grant (unsolicited re-grant) -> Ack, store the new canonical,
-            // send RenderCmd::Draw { resource, fd: dup } (fresh lend).
-            // Disconnect -> disown everything (drop canonicals + Stop each
-            // borrower), return.
+            // what this session holds.
+        pub fn start_event_loop<F>(&mut self, on_event: F)
+        where
+            F: FnMut(SgcEvent);
+            // BLOCKING loop on the app thread until the connection ends.
     }
 
-    pub enum RenderCmd {                       // resource-tagged for multi-resource apps
-        Draw { resource: Resource, fd: OwnedFd },
-        Stop { resource: Resource },
+    pub enum SgcEvent {                       // resource-tagged for multi-resource apps
+        Revoked { resource: Resource },       // stop drawing, drop the dup
+        Granted { resource: Resource, fd: OwnedFd },  // fresh dup, draw
     }
 
-### The rules (why it is sound)
+### Event-loop semantics
 
-1. **The canonical fd never leaves the client.** `fd()` is the only path
-   and it always dups. Then two owners of the same `OwnedFd` are
-   impossible by construction — no double close, no abort.
-2. **Borrowers own their dups.** The render task keeps its dup until
-   `Stop`, then drops it. The client's canonical is dropped at the same
-   time (revoke) — both refer to the same file description, so each side
-   closing its own fd is correct.
-3. **Revoke reaches the borrower.** The event loop sends a tagged `Stop`
-   so the right borrower drops the right dup. With one render channel the
-   tag is the routing key; a multi-resource app can hold per-resource
-   renderers.
-4. **Cleanup is guaranteed.** Disconnect disowns everything the client
-   holds — the library cannot leak a resource the app forgot about (the
-   single-fd design relies on the app dropping its fd).
+- `Revoke { resources }` -> drop each canonical from `held`, emit `Revoked`
+  for each, reply `Release` (the revoke-ack; the server waits <=5s, then
+  force-reclaims and does NOT requeue).
+- `Grant` (unsolicited re-grant) -> `Ack` it (5s server timer), store the new
+  canonical, emit `Granted` with a fresh dup — no `acquire` needed.
+- Disconnect (EOF/error) -> disown everything (drop canonicals, emit
+  `Revoked` per held resource), return.
 
-### Test evidence (board, real `/dev/fb0`, FairQueue policy)
+Re-grant is a wire `Grant` handled in the event loop, not an `acquire()`
+result; `acquire()` is only for startup requests.
 
+### Why it is sound
+
+1. **The canonical never leaves the client.** `fd()` always dups — two owners
+   of the same `OwnedFd` are impossible by construction; no double close.
+2. **Borrowers own their dups.** The borrower drops its dup on `Revoked`; the
+   client drops the canonical at the same time — both refer to the same file
+   description.
+3. **Revoke reaches the borrower.** `Revoked` is resource-tagged; the tag is
+   the routing key for per-resource renderers.
+4. **Cleanup is guaranteed.** Disconnect disowns everything — no leaked
+   resource.
+
+### App-side mapping
+
+The library maps wire messages to `SgcEvent`; the app maps `SgcEvent` to its
+own commands (the demos' tagged `RenderCmd`):
+
+    client.start_event_loop(|event| match event {
+        SgcEvent::Revoked { resource } => { let _ = render_tx.send(RenderCmd::Stop { resource }); }
+        SgcEvent::Granted { resource, fd } => { let _ = render_tx.send(RenderCmd::Draw { resource, fd }); }
+    });
+
+## Usage model (the app's view)
+
+```mermaid
+flowchart LR
+    boot([app start]) --> conn["SgcClient::connect()<br/>connect + read Advertise"]
+    conn --> chk{"server offers<br/>the resource?"}
+    chk -- no --> giveup([give up or retry later])
+    chk -- yes --> acq["client.acquire(Fbdev)<br/>BLOCKS until the server answers"]
+    acq -- Denied --> giveup
+    acq -- Ok --> hold["client HOLDS the canonical fd"]
+    hold --> lend["fd = client.fd(&Fbdev)<br/>lend: fresh dup"]
+    lend --> spawn["spawn render task<br/>first Draw with the dup"]
+    spawn --> evloop["client.start_event_loop(on_event)<br/>BLOCKS until connection ends"]
+    evloop -- Revoke --> revoke["drop canonical<br/>on_event(Revoked)<br/>reply Release"]
+    revoke --> evloop
+    evloop -- "Grant (re-grant)" --> regrant["Ack, store new canonical<br/>on_event(Granted) + fresh dup"]
+    regrant --> evloop
+    evloop -- disconnect --> done(["disown everything<br/>return"])
 ```
-A: granted Fbdev (client holds fd) -> held: [Fbdev] -> [render] drawing
-B preempts A -> A: revoked Fbdev -> [render] stopped Fbdev
-B dies       -> A: re-granted Fbdev -> [render] drawing Fbdev   (fresh dup)
-```
 
-`held` reflected the true state at every step; revoke dropped the
-canonical; the re-grant lent a fresh dup and the renderer (kept across the
-revoke, mmap still valid) redrew. No fd leaks, no double-close.
+`acquire()` BLOCKS until the outcome is known; queued requests are
+indistinguishable from immediate grants — the point. The fd for drawing always
+comes from a lend (`fd()`) or a `Granted` event, never from `acquire()`.
 
-### Status / open questions
+## App structure (the demos)
 
-- Prototyped in the demo crate only; `sgc-fbdev-client` keeps the
-  move-based design (both committed in `ac9c601`; the ownership rework is
-  the current uncommitted change in `sgc-fbdev-client-2`).
-- `release()` (voluntary hand-back) is not implemented — the demos render
-  until killed and never release. When it lands: check `held`, write
-  `Release`, remove from `held`.
-- Multi-resource acquisition is still one resource at a time (the server
-  denies multi-resource Acquire anyway); the `HashMap` + tagged `RenderCmd`
-  are the routing for when that changes.
+- main thread: connect → check advertised resources → acquire (blocking) →
+  lend a dup → spawn render task → first `Draw` with the dup →
+  `start_event_loop` mapping `SgcEvent` → `RenderCmd` → send `Stop`/`Exit`,
+  drop sender, join.
+- render task: receives `RenderCmd` on an mpsc channel; builds the renderer
+  from the first `Draw` fd (linfb is `!Send`, so it must be built there); owns
+  its dup (drops it on `Stop`); redraws its cached scene on every `Draw`.
+- The demos render until killed: no `--hold`, no graceful release — the server
+  frees the resource on disconnect.
+- `sgc-fbdev-client`: bouncing-rect scene; main + `logic` + `render` +
+  `timer` (16ms logic / 33ms draw timers on one loop; `RenderCmd` adds
+  `Exit`).
+- `sgc-fbdev-client-2`: checkerboard scene; main + `render`.
+
+## Renderer constraints (linfb)
+
+- `Compositor` is `!Send` (holds `Box<dyn Shape>`) — build the Renderer inside
+  the render task, not in main.
+- `Framebuffer::open_with_fd` takes ownership of the fd — hand it a dup
+  (`OwnedFd::try_clone`); the canonical stays with the client.
+- Create the Renderer once and KEEP it across revokes: the fbdev mmap stays
+  valid after the fd closes (mmap holds the file description), so a
+  revoke/regrant cycle just redraws.
+- Opening (ioctls + mmap) and building the scene (fonts) are the expensive
+  parts — hence exactly once; redrawing the static compositor is draw + flush.
+
+## Wire mechanics
+
+- Every read is recvmsg (`sendfd::RecvWithFd`), header included — fds attach
+  to the first bytes of a Grant frame; a plain read silently discards them.
+- SCM_RIGHTS fds -> `unsafe { OwnedFd::from_raw_fd(fd) }` (sound: ownership
+  transfers; no safe `TryFrom<RawFd>` exists).
+- Ack after every Grant (initial and regrant — the server arms a 5s ack timer
+  each time). Release on Revoke is the revoke-ack.
+- Regrant arrives unsolicited — normal preemption handoff; just Ack and hand
+  the fd on.
 
 ## Error mapping
 
-`SgcError` (thiserror, 6 variants — no anyhow in the public API):
+`SgcError` (thiserror, 7 variants):
 
 | site | variant |
 | ---- | ------- |
 | connect: no server / refused | `ConnectFailed(io)` |
-| connect: bad frame or non-`Advertise` first message | `Protocol` / `UnexpectedMessage` |
+| connect: bad frame / non-`Advertise` first message | `Protocol` / `UnexpectedMessage` |
+| fail-fast: resource not offered | `NotAvailable { resource }` |
 | acquire: server deny | `Denied { reason }` |
 | acquire: grant without exactly 1 fd | `Io(InvalidData)` |
-| acquire/event loop: wire write/read failure | `Io` |
+| acquire/event loop: wire failure | `Io` |
 | any: frame decode | `Protocol` |
-| lend (`fd()`) of a resource not held | `NotHeld { resource }` |
+| `fd()` of a resource not held | `NotHeld { resource }` |
 
-EOF inside the event loop is normal teardown ("connection lost"), not an
-error the app must handle.
+EOF inside the event loop is normal teardown, not an app-facing error.
 
-## Status
+## Testing
 
-The design is FINAL and board-verified (see the intro). What remains is
-the mechanical extraction:
+- 4 unit tests in `libsgc-rs/src/client.rs` against a fake controller on an
+  abstract socket: no-server connect, Advertise read, Deny surfaces reason,
+  Grant stores canonical + lends dup (real SCM_RIGHTS). Run:
+  `cargo test -p libsgc-rs`.
+- Board validation (aarch64, real `/dev/fb0`):
 
-| step | objective | state |
-| ---- | --------- | ----- |
-| 1 | validate the design inline in `sgc-fbdev-client` | done — committed (`ac9c601`); verified on the aarch64 board |
-| 2 | sibling demo `sgc-fbdev-client-2` (same client, different scene) | done — committed (`ac9c601`) |
-| 3 | ownership-model prototype in `sgc-fbdev-client-2` (client holds fds, `fd()` lends dups, tagged `RenderCmd`) | done — reflected into `sgc-fbdev-client`, then superseded by the crate |
-| 4 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | done — `comm.rs` reader-thread scaffold removed; sync client-ownership design in `client.rs` |
-| 5 | rework `libsgc-rs` crate API surface to the final shape above | done — one generalization: `start_event_loop(on_event: FnMut(SgcEvent))` (callback instead of the demo-coupled `&mpsc::Sender<RenderCmd>`); the demos map `SgcEvent::{Revoked, Granted}` to their `RenderCmd` |
-| 6 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | done — 4 tests: no-server connect, Advertise read, Deny surfaces reason, Grant holds fd + lends dup (real SCM_RIGHTS via `send_with_fd`) |
-| 7 | real-daemon matrix on a test socket (needs `SGC_SOCKET` + `SGC_FBDEV_PATH` knobs on the server) | pending |
-| 8 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | done — both demos are now `main.rs` + `render.rs` only, linked against `libsgc-rs`; verified on the Alpine VM against the real daemon (granted, held, drawing) |
+```
+A: granted -> held: [Fbdev] -> drawing
+B preempts -> A: revoked -> stopped
+B dies     -> A: re-granted -> drawing (fresh dup)
+```
 
-Workflow: one step per commit, `cargo check`/`cargo test -p libsgc-rs`
-green per commit, diff shown to the user before committing.
+`held` matched the true state at every step; no fd leaks, no double close.
 
-## Explicit non-goals (v1)
+- Open: real-daemon test matrix on a test socket (needs `SGC_SOCKET` +
+  `SGC_FBDEV_PATH` server knobs).
 
-- Multi-resource `acquire` (server denies it anyway; revisit with the
-  server).
-- Acquire timeout (a future `acquire_timeout` is a one-liner — the reply
-  is a direct read; do not build it in now).
-- Non-blocking `acquire` (an app that must not block its main thread runs
-  the client on a worker thread; the client itself never blocks anything
-  else).
+## Open items
+
+- `release()` (voluntary hand-back) not implemented: check `held`, write
+  `Release`, remove from `held` when it lands.
+- Multi-resource acquisition is one resource at a time (server denies
+  multi-resource Acquire anyway); `HashMap` + tagged events are the routing
+  for when that changes.
+
+## Non-goals (v1)
+
+- Multi-resource `acquire` (server denies it anyway).
+- Acquire timeout (a one-liner later — the reply is a direct read).
+- Non-blocking `acquire` (run the client on a worker thread instead).
 - Reconnect logic (session dies loudly; the app reconnects).
-- The C client library (LVGL) — a later crate; the wire spec it needs is
-  already in `docs/PROTOCOL.md`.
+- C client library (LVGL) — later crate; wire spec in `docs/PROTOCOL.md`.
