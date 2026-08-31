@@ -3,6 +3,8 @@ members = [
     "simple-graphics-controller",
     "simple-graphics-protocol",
     "sgc-fbdev-client",
+    "sgc-fbdev-client-2",
+    "libsgc-rs",
 ]
 resolver = "2"
 
