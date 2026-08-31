@@ -1,28 +1,23 @@
-//! Demo client for simple-graphics-controller — CLIENT-OWNERSHIP variant.
+//! Demo client for simple-graphics-controller — built on `libsgc-rs`.
 //!
-//! Same app skeleton as `sgc-fbdev-client` (connect, check the advertised
-//! resources, acquire, spawn a render task, event loop), but the client
-//! HOLDS the granted fd and LENDS a dup to the render task:
+//! The client HOLDS the granted fd (client-ownership) and LENDS a dup to
+//! the render task:
 //!
 //! - `SgcClient::acquire` stores the canonical fd (client-owned);
 //! - `SgcClient::fd` returns a fresh dup for the borrower;
 //! - revoke drops the canonical and tells the render task to stop;
 //! - re-grant stores the new canonical and lends a fresh dup.
 //!
-//! This is the prototype for the multi-resource future (one held fd per
-//! resource, one owner of the truth: the client). `sgc-fbdev-client` keeps
-//! the simpler move-based design.
+//! Multi-resource ready: one held fd per resource, one owner of the
+//! truth — the client. Renders a different scene than `sgc-fbdev-client`
+//! (checkerboard instead of rects + wrapped text).
 
-mod client;
-mod error;
 mod render;
 
 use std::{sync::mpsc, thread};
 
-use client::SgcClient;
-use error::SgcError;
+use libsgc_rs::{Resource, SgcClient, SgcError, SgcEvent};
 use render::RenderCmd;
-use simple_graphics_protocol::Resource;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut client, available) = SgcClient::connect()?;
@@ -70,7 +65,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The client's event loop: revoke -> drop canonical + stop render,
     // re-grant -> store canonical + draw with a fresh dup, disconnect ->
     // disown everything. Blocks until the connection ends.
-    client.start_event_loop(&render_tx);
+    client.start_event_loop(|event| match event {
+        SgcEvent::Revoked { resource } => {
+            let _ = render_tx.send(RenderCmd::Stop { resource });
+        }
+        SgcEvent::Granted { resource, fd } => {
+            let _ = render_tx.send(RenderCmd::Draw { resource, fd });
+        }
+    });
 
     let _ = render_tx.send(RenderCmd::Stop {
         resource: Resource::Fbdev,

@@ -7,4 +7,3 @@ edition = "2024"
 simple-graphics-protocol = { path = "../simple-graphics-protocol" }
 sendfd = "0.4.4"
 thiserror = "1"
-tracing = "0.1"

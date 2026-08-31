@@ -1,129 +1,186 @@
-//! The render task: owns the renderer (framebuffer + scene) and the
-//! borrowed fd. It is driven by [`RenderCmd`] messages from the main
-//! thread's event loop — the message-passing mechanism between threads.
+//! The render task: owns the renderer (framebuffer + motion state) and the
+//! borrowed fd, and runs the LVGL-style timer system:
+//!
+//! - logic timer (16ms): advances the animation state;
+//! - draw timer (33ms): repaints the framebuffer.
+//!
+//! Both timers live in [`TimerList`] and fire on this thread; the channel
+//! from main (`Draw`/`Stop`/`Exit`) and the timer deadlines wake the same
+//! `recv_timeout` loop — one loop, one wakeup source, like `lv_timer_handler`.
 //!
 //! The fd arrives as a DUP lent by the client (client-ownership model):
 //! the render task owns its dup until `Stop`, when it drops it.
 
-use std::{os::fd::OwnedFd, sync::mpsc};
-
-use linfb::{
-    Compositor, Framebuffer,
-    shape::{Alignment, Caption, Color, FontBuilder, Rectangle, Shape},
+use std::{
+    os::fd::{IntoRawFd, OwnedFd},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
-use simple_graphics_protocol::Resource;
 
-/// Commands from the client's event loop to the render task.
+use libsgc_rs::Resource;
+use linfb::{
+    Framebuffer,
+    shape::{Rectangle, Shape},
+};
+
+use crate::logic::{LOGIC_INTERVAL, Motion};
+use crate::timer::TimerList;
+
+pub const RECT_WIDTH: i32 = 100;
+pub const RECT_HEIGHT: i32 = 100;
+
+pub const DRAW_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Commands from main (the client's event loop) to the render task.
 pub enum RenderCmd {
-    /// A grant (initial or re-grant): draw with this fd. Resource-tagged
-    /// so a multi-resource app can route to the right renderer.
+    /// A grant (initial or re-grant): draw with this fd.
     Draw { resource: Resource, fd: OwnedFd },
     /// Revoked: stop rendering and drop the borrowed fd.
     Stop { resource: Resource },
+    /// Main is done (connection lost): drop the fd and exit the loop.
+    Exit,
 }
 
-/// The renderer: framebuffer + scene, created ONCE per app run from the
-/// first granted fd and owned by the render task. Opening the framebuffer
-/// (ioctls + mmap) and building the scene (font loading) are the expensive
-/// parts, so they happen exactly once. The mmap stays valid across
-/// re-grants (same device), so a revoked-then-regranted cycle just
-/// redraws.
+/// The renderer: framebuffer + motion state. Opening the framebuffer
+/// (ioctls + mmap) is the expensive part, so it happens exactly once; the
+/// mmap stays valid across re-grants (same device), so a
+/// revoked-then-regranted cycle just redraws.
 pub struct Renderer {
     framebuffer: Framebuffer,
-    compositor: Compositor,
+    motion: Motion,
 }
 
 impl Renderer {
-    /// Open the framebuffer and build the scene from the granted fd.
-    /// linfb takes ownership of the fd it is given (File::from_raw_fd), so
-    /// it gets a dup — the caller keeps the granted fd.
+    /// Open the framebuffer from the granted fd. linfb takes ownership of
+    /// the fd it is given (File::from_raw_fd), so it gets a dup — the
+    /// caller keeps the granted fd.
     pub fn from_fd(fd: &OwnedFd) -> Result<Self, Box<dyn std::error::Error>> {
-        use std::os::fd::IntoRawFd;
-
         let dup = fd.try_clone()?;
         let framebuffer =
             Framebuffer::open_with_fd(dup.into_raw_fd()).expect("framebuffer open failed");
-        let mut compositor = framebuffer.compositor((255, 255, 255).into());
-        compositor
-            .add(
-                "rect1",
-                Rectangle::builder()
-                    .width(100)
-                    .height(100)
-                    .fill_color(Color::hex("#ff000099").unwrap())
-                    .build()
-                    .unwrap()
-                    .at(100, 100),
-            )
-            .add(
-                "rect2",
-                Rectangle::builder()
-                    .width(100)
-                    .height(100)
-                    .fill_color(Color::hex("#00ff0099").unwrap())
-                    .build()
-                    .unwrap()
-                    .at(150, 150),
-            )
-            .add(
-                "wrapped_text",
-                Caption::builder()
-                    .text("Some centered text\nwith newlines".into())
-                    .size(56)
-                    .color(Color::hex("#4066b877").unwrap())
-                    .font(FontBuilder::default().family("monospace").build().unwrap())
-                    .alignment(Alignment::Center)
-                    .max_width(650)
-                    .build()
-                    .unwrap()
-                    .at(1000, 300),
-            );
+
+        let screen_info = framebuffer.screen_info.clone();
+
         Ok(Self {
             framebuffer,
-            compositor,
+            motion: Motion::new(
+                screen_info.xres as i32,
+                screen_info.yres as i32,
+                RECT_WIDTH,
+                RECT_HEIGHT,
+            ),
         })
     }
 
-    /// Redraw the cached scene.
+    /// One logic tick (16ms): advance the animation state.
+    pub fn tick(&mut self) {
+        let _ = self.motion.tick();
+    }
+
+    /// One draw (33ms): paint the rect at the current position.
     pub fn draw(&mut self) {
-        self.framebuffer.draw(0, 0, &self.compositor);
+        let (x, y) = self.motion.position();
+        self.draw_at(x, y);
+    }
+
+    fn draw_at(&mut self, x: i32, y: i32) {
+        let mut compositor = self.framebuffer.compositor((255, 255, 255).into());
+
+        compositor.add(
+            "rect1",
+            Rectangle::builder()
+                .width(RECT_WIDTH as usize)
+                .height(RECT_HEIGHT as usize)
+                .fill_color(self.motion.color())
+                .build()
+                .unwrap()
+                .at(x as usize, y as usize),
+        );
+
+        self.framebuffer.draw(0, 0, &compositor);
         self.framebuffer.flush();
     }
 }
 
-/// Render task: owns the renderer and the granted fd; redraws on `Draw`,
-/// drops the fd on `Stop`. Runs until the channel closes (main is gone),
-/// then drops the renderer (closes the framebuffer).
-///
-/// The renderer is created HERE, inside the task, from the first granted
-/// fd — linfb's scene graph is `!Send` (`Box<dyn Shape>`), so it cannot be
-/// moved across threads. Created once per app run; kept across revokes
-/// (the mmap stays valid — same device — so a re-grant just redraws).
+/// Everything the timers and commands touch: the renderer (created lazily
+/// from the first granted fd) and the granted fd (None while revoked).
+struct RenderState {
+    renderer: Option<Renderer>,
+    current_fd: Option<OwnedFd>,
+}
+
+/// Render task: runs the timer system and the command loop until the
+/// channel closes. The logic timer keeps advancing the animation even
+/// while revoked (background work); only drawing stops without a grant.
 pub fn run(rx: mpsc::Receiver<RenderCmd>) {
-    let mut renderer: Option<Renderer> = None;
-    let mut current: Option<OwnedFd> = None;
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            RenderCmd::Draw { resource, fd } => {
-                if renderer.is_none() {
-                    match Renderer::from_fd(&fd) {
-                        Ok(renderer_) => renderer = Some(renderer_),
-                        Err(e) => {
-                            eprintln!("[render] open failed: {e}");
-                            continue;
+    let mut state = RenderState {
+        renderer: None,
+        current_fd: None,
+    };
+
+    let mut timers: TimerList<RenderState> = TimerList::new();
+
+    timers.register(LOGIC_INTERVAL, |s| {
+        if let Some(renderer) = s.renderer.as_mut() {
+            renderer.tick();
+        }
+    });
+
+    timers.register(DRAW_INTERVAL, |s| {
+        if s.current_fd.is_some()
+            && let Some(renderer) = s.renderer.as_mut()
+        {
+            renderer.draw();
+        }
+    });
+
+    loop {
+        // Wait for a command, but no longer than the earliest timer
+        // deadline — timer fires and commands wake the same loop.
+        let timeout = timers
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(Instant::now()));
+
+        let result = match timeout {
+            Some(t) => rx.recv_timeout(t),
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+
+        match result {
+            Ok(cmd) => match cmd {
+                RenderCmd::Draw { resource, fd } => {
+                    if state.renderer.is_none() {
+                        match Renderer::from_fd(&fd) {
+                            Ok(value) => state.renderer = Some(value),
+                            Err(error) => {
+                                eprintln!("[render] framebuffer open failed: {error}");
+                                continue;
+                            }
                         }
                     }
+
+                    state.current_fd = Some(fd);
+
+                    if let Some(renderer) = state.renderer.as_mut() {
+                        renderer.draw();
+                    }
+
+                    println!("[render] drawing {resource:?}");
                 }
-                current = Some(fd);
-                if let Some(renderer) = &mut renderer {
-                    renderer.draw();
+                RenderCmd::Stop { resource } => {
+                    state.current_fd.take();
+                    println!("[render] stopped {resource:?}");
                 }
-                println!("[render] drawing {resource:?}");
+                RenderCmd::Exit => {
+                    state.current_fd.take();
+                    println!("[render] exited");
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timers.fire_due(Instant::now(), &mut state);
             }
-            RenderCmd::Stop { resource } => {
-                current.take(); // disown the borrowed fd
-                println!("[render] stopped {resource:?}");
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

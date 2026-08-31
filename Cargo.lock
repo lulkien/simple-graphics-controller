@@ -411,7 +411,6 @@ dependencies = [
  "sendfd",
  "simple-graphics-protocol",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -842,20 +841,16 @@ dependencies = [
 name = "sgc-fbdev-client"
 version = "0.1.0"
 dependencies = [
+ "libsgc-rs",
  "linfb",
- "sendfd",
- "simple-graphics-protocol",
- "thiserror",
 ]
 
 [[package]]
 name = "sgc-fbdev-client-2"
 version = "0.1.0"
 dependencies = [
+ "libsgc-rs",
  "linfb",
- "sendfd",
- "simple-graphics-protocol",
- "thiserror",
 ]
 
 [[package]]

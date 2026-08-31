@@ -11,7 +11,7 @@ use linfb::{
     Compositor, Framebuffer,
     shape::{Caption, Color, FontBuilder, Rectangle, Shape},
 };
-use simple_graphics_protocol::Resource;
+use libsgc_rs::Resource;
 
 /// Commands from the client's event loop to the render task.
 pub enum RenderCmd {

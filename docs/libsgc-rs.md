@@ -250,12 +250,12 @@ the mechanical extraction:
 | ---- | --------- | ----- |
 | 1 | validate the design inline in `sgc-fbdev-client` | done — committed (`ac9c601`); verified on the aarch64 board |
 | 2 | sibling demo `sgc-fbdev-client-2` (same client, different scene) | done — committed (`ac9c601`) |
-| 3 | ownership-model prototype in `sgc-fbdev-client-2` (client holds fds, `fd()` lends dups, tagged `RenderCmd`) | implemented + board-verified (uncommitted) |
-| 4 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | pending |
-| 5 | rework `libsgc-rs` crate API surface to the final shape above | pending |
-| 6 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | pending |
+| 3 | ownership-model prototype in `sgc-fbdev-client-2` (client holds fds, `fd()` lends dups, tagged `RenderCmd`) | done — reflected into `sgc-fbdev-client`, then superseded by the crate |
+| 4 | extract `client.rs` + `error.rs` into `libsgc-rs`, replacing the phase-2 threaded scaffold | done — `comm.rs` reader-thread scaffold removed; sync client-ownership design in `client.rs` |
+| 5 | rework `libsgc-rs` crate API surface to the final shape above | done — one generalization: `start_event_loop(on_event: FnMut(SgcEvent))` (callback instead of the demo-coupled `&mpsc::Sender<RenderCmd>`); the demos map `SgcEvent::{Revoked, Granted}` to their `RenderCmd` |
+| 6 | fake-server tests (readiness handshake via `sync_channel(0)`; failure path via a nonexistent abstract name) | done — 4 tests: no-server connect, Advertise read, Deny surfaces reason, Grant holds fd + lends dup (real SCM_RIGHTS via `send_with_fd`) |
 | 7 | real-daemon matrix on a test socket (needs `SGC_SOCKET` + `SGC_FBDEV_PATH` knobs on the server) | pending |
-| 8 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | pending |
+| 8 | demo refactor: `sgc-fbdev-client`/`-2` link libsgc-rs instead of their inline `client.rs` | done — both demos are now `main.rs` + `render.rs` only, linked against `libsgc-rs`; verified on the Alpine VM against the real daemon (granted, held, drawing) |
 
 Workflow: one step per commit, `cargo check`/`cargo test -p libsgc-rs`
 green per commit, diff shown to the user before committing.
