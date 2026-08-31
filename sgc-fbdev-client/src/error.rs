@@ -1,6 +1,6 @@
 //! Typed errors for the client.
 
-use simple_graphics_protocol::{ProtocolError, ServerMessage};
+use simple_graphics_protocol::{ProtocolError, Resource, ServerMessage};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +13,10 @@ pub enum SgcError {
     /// resource is not registered).
     #[error("acquire denied: {reason}")]
     Denied { reason: String },
+
+    /// Tried to borrow a resource this session does not hold.
+    #[error("resource not held: {resource:?}")]
+    NotHeld { resource: Resource },
 
     /// Message encoding/decoding failed.
     #[error("protocol error: {0}")]

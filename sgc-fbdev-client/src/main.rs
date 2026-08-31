@@ -1,19 +1,14 @@
-//! Demo client for simple-graphics-controller.
+//! Demo client for simple-graphics-controller — CLIENT-OWNERSHIP variant.
 //!
-//! Architecture:
+//! The client HOLDS the granted fd and LENDS a dup to the render task:
 //!
-//! - main thread: drives the [`SgcClient`] — connect, acquire (blocking),
-//!   then the client's own event loop until the connection ends;
-//! - render task ([`render`]): owns the renderer (framebuffer + scene),
-//!   built from the granted fd; driven by [`render::RenderCmd`] messages
-//!   sent by the client's event loop.
+//! - `SgcClient::acquire` stores the canonical fd (client-owned);
+//! - `SgcClient::fd` returns a fresh dup for the borrower;
+//! - revoke drops the canonical and tells the render task to stop;
+//! - re-grant stores the new canonical and lends a fresh dup.
 //!
-//! Flow: connect -> check the advertised resources -> acquire (blocking)
-//! -> spawn render task, send it the fd -> client event loop (Revoke ->
-//! Stop + revoke-ack, re-Grant -> Draw with the new fd, disconnect ->
-//! stop) -> wait for the render task. The app keeps rendering until
-//! killed: the server revokes on preemption, re-grants later, and frees
-//! the resource on our disconnect when we die.
+//! Multi-resource ready: one held fd per resource, one owner of the
+//! truth — the client.
 
 mod client;
 mod error;
@@ -36,9 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Got the fd from the server (blocking; queued requests block here).
-    let fd = match client.acquire(Resource::Fbdev) {
-        Ok(fd) => fd,
+    // Request the resource (blocking; queued requests block here). The
+    // client now owns the canonical fd.
+    match client.acquire(Resource::Fbdev) {
+        Ok(()) => println!("granted Fbdev (client holds fd)"),
         Err(SgcError::Denied { reason }) => {
             eprintln!("denied: {reason}");
             return Ok(());
@@ -48,19 +44,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    println!("granted Fbdev");
+    println!("held: {:?}", client.held());
+
+    // Borrow a dup for the render task; the client keeps the canonical.
+    let fd = match client.fd(&Resource::Fbdev) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("lend failed: {e}");
+            return Ok(());
+        }
+    };
 
     // Send the fd to the render task; it builds the renderer from it
     // (linfb's scene graph is !Send, so it must be created there).
     let (render_tx, render_rx) = mpsc::channel();
     let render = thread::spawn(move || render::run(render_rx));
-    render_tx.send(RenderCmd::Draw(fd))?;
+    render_tx.send(RenderCmd::Draw {
+        resource: Resource::Fbdev,
+        fd,
+    })?;
 
-    // The client's event loop: revoke -> stop render, re-grant -> draw,
-    // disconnect -> stop. Blocks until the connection ends.
+    // The client's event loop: revoke -> drop canonical + stop render,
+    // re-grant -> store canonical + draw with a fresh dup, disconnect ->
+    // disown everything. Blocks until the connection ends.
     client.start_event_loop(&render_tx);
 
-    let _ = render_tx.send(RenderCmd::Stop);
+    let _ = render_tx.send(RenderCmd::Stop {
+        resource: Resource::Fbdev,
+    });
     drop(render_tx);
     let _ = render.join();
     Ok(())

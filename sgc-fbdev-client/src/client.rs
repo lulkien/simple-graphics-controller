@@ -1,13 +1,19 @@
-//! The client: a plain synchronous wrapper over the `@sgc` stream.
+//! The client: a plain synchronous wrapper over the `@sgc` stream, with
+//! CLIENT-SIDE RESOURCE OWNERSHIP.
 //!
-//! No background threads, no shared state: the client is driven by ONE app
-//! thread, which blocks in [`SgcClient::acquire`] / 
-//! [`SgcClient::start_event_loop`]. The app must keep that thread on the
-//! socket while it holds the resource — the server's revoke/ack timeouts
-//! are real deadlines. Other threads (e.g. the render task) talk to the
-//! app via channels, never to the client.
+//! The client holds the granted fds (one per resource) and LENDS them out:
+//! [`SgcClient::fd`] returns a fresh dup, never the canonical fd. The
+//! canonical is owned by the client and dropped when the resource is
+//! revoked or the session ends — the library cannot leak a resource the
+//! app forgot about.
+//!
+//! Still single-threaded: one app thread drives acquire + the event loop;
+//! borrowers (e.g. the render task) talk to the app via channels and never
+//! to the client. The app thread must stay in the event loop while
+//! resources are held — the server's 5s revoke/ack deadlines are real.
 
 use std::{
+    collections::HashMap,
     io::{self, ErrorKind, Write},
     os::{
         fd::{FromRawFd, OwnedFd, RawFd},
@@ -27,8 +33,14 @@ use crate::error::SgcError;
 use crate::render::RenderCmd;
 
 /// A connected session to the graphics controller, driven by one thread.
+///
+/// Owns the granted fds: `acquire` stores them in [`SgcClient::held`],
+/// [`SgcClient::fd`] lends dups, revoke/disconnect drops them.
 pub struct SgcClient {
     stream: UnixStream,
+    /// Canonical fds of the resources we hold, owned by the client. Never
+    /// handed out by value — [`SgcClient::fd`] dups.
+    held: HashMap<Resource, OwnedFd>,
 }
 
 impl SgcClient {
@@ -45,17 +57,24 @@ impl SgcClient {
         match msg {
             ServerMessage::Advertise { available_resources } => {
                 println!("connected to @sgc; available: {available_resources:?}");
-                Ok((Self { stream }, available_resources))
+                Ok((
+                    Self {
+                        stream,
+                        held: HashMap::new(),
+                    },
+                    available_resources,
+                ))
             }
             other => Err(SgcError::UnexpectedMessage(other)),
         }
     }
 
-    /// Request `resource` and BLOCK until the server answers: write
-    /// Acquire, read the reply frame, Ack the grant, return the fd.
-    pub fn acquire(&mut self, resource: Resource) -> Result<OwnedFd, SgcError> {
+    /// Request `resource` and BLOCK until the server answers. On grant the
+    /// fd is stored in `held` (client-owned); the app borrows it via
+    /// [`SgcClient::fd`]. On `Deny` nothing is held.
+    pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError> {
         self.write_frame(&ClientRequest::Acquire {
-            resources: vec![resource],
+            resources: vec![resource.clone()],
         })?;
 
         let (msg, fds) = read_framed(&mut self.stream)?;
@@ -72,47 +91,90 @@ impl SgcClient {
                 let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
                 // Ack the grant: the server waits up to 5s for it.
                 self.write_frame(&ClientRequest::Ack)?;
-                Ok(fd)
+                self.held.insert(resource, fd);
+                Ok(())
             }
             ServerMessage::Deny { reason } => Err(SgcError::Denied { reason }),
             other => Err(SgcError::UnexpectedMessage(other)),
         }
     }
 
+    /// Borrow `resource`: returns a DUP of the held fd (the client keeps
+    /// the canonical). The borrower owns the dup and must drop it when the
+    /// resource is revoked (it learns that via `RenderCmd::Stop`).
+    pub fn fd(&self, resource: &Resource) -> Result<OwnedFd, SgcError> {
+        self.held
+            .get(resource)
+            .ok_or_else(|| SgcError::NotHeld { resource: resource.clone() })
+            .and_then(|fd| fd.try_clone().map_err(SgcError::Io))
+    }
+
+    /// The resources this session currently holds.
+    pub fn held(&self) -> Vec<Resource> {
+        self.held.keys().cloned().collect()
+    }
+
     /// The client's event loop: block reading frames until the connection
     /// ends, driving the render task through its command channel.
     ///
-    /// - `Revoke` -> tell the render task to stop, reply `Release` (the
-    ///   revoke-ack; the server waits up to 5s for it);
-    /// - `Grant` (the unsolicited re-grant) -> Ack it, hand the fd to the
-    ///   render task;
-    /// - disconnected -> send `Stop` and return.
+    /// - `Revoke { resources }` -> drop the canonical fds (disown), tell
+    ///   the render task to stop, reply `Release` (the revoke-ack; the
+    ///   server waits up to 5s for it);
+    /// - `Grant` (the unsolicited re-grant) -> Ack it, store the canonical
+    ///   fd, lend a dup to the render task;
+    /// - disconnected -> disown everything, tell the render task to stop,
+    ///   return.
     pub fn start_event_loop(&mut self, render_tx: &mpsc::Sender<RenderCmd>) {
         loop {
             let (msg, fds) = match read_framed(&mut self.stream) {
                 Ok(x) => x,
                 Err(e) => {
                     println!("connection lost: {e}");
+                    // Disown everything we hold: drop the canonicals and
+                    // tell the borrowers to drop their dups.
+                    for resource in self.held.keys().cloned().collect::<Vec<_>>() {
+                        self.held.remove(&resource);
+                        let _ = render_tx.send(RenderCmd::Stop { resource });
+                    }
                     break;
                 }
             };
             match msg {
                 ServerMessage::Revoke { resources } => {
-                    println!("revoked {resources:?}; stopping render");
-                    let _ = render_tx.send(RenderCmd::Stop);
+                    for resource in &resources {
+                        println!("revoked {resource:?}; stopping render");
+                        // Drop the canonical; the borrower drops its dup
+                        // on Stop.
+                        self.held.remove(resource);
+                        let _ = render_tx.send(RenderCmd::Stop {
+                            resource: resource.clone(),
+                        });
+                    }
                     // Revoke-ack: Release doubles as the acknowledgment.
                     let _ = self.write_frame(&ClientRequest::Release { resources });
                 }
-                ServerMessage::Grant { .. } => {
+                ServerMessage::Grant { resources } => {
                     if fds.len() != 1 {
                         eprintln!("grant carried {} fds; ignoring", fds.len());
                         continue;
                     }
+                    let Some(resource) = resources.first() else {
+                        eprintln!("grant without resources; ignoring");
+                        continue;
+                    };
+                    let resource = resource.clone();
                     // Safety: SCM_RIGHTS transfers ownership to us.
                     let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
                     let _ = self.write_frame(&ClientRequest::Ack);
-                    println!("re-granted; drawing");
-                    let _ = render_tx.send(RenderCmd::Draw(fd));
+                    // Re-grant: store the canonical, lend a dup to render.
+                    self.held.insert(resource.clone(), fd);
+                    println!("re-granted {resource:?}; drawing");
+                    match self.fd(&resource) {
+                        Ok(fd) => {
+                            let _ = render_tx.send(RenderCmd::Draw { resource, fd });
+                        }
+                        Err(e) => eprintln!("lend failed: {e}"),
+                    }
                 }
                 other => {
                     eprintln!("unexpected server message: {other:?}; ignoring");
