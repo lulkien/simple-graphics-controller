@@ -40,7 +40,8 @@ fds and lends them out. The app never touches the canonical fd.
     impl SgcClient {
         pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
             // connect + read Advertise; the advertised list lets the app
-            // fail fast ("server does not offer Fbdev") without a Deny round trip.
+            // fail fast ("server does not offer Display(Fbdev)") without a
+            // Deny round trip.
         pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError>;
             // write Acquire -> read Grant -> Ack -> store the canonical in `held`.
             // Deny { reason } -> Err(Denied). Nothing held on error. The fd
@@ -62,11 +63,12 @@ fds and lends them out. The app never touches the canonical fd.
 
 ### Event-loop semantics
 
-- `Revoke { resources }` -> drop each canonical from `held`, emit `Revoked`
-  for each, reply `Release` (the revoke-ack; the server waits <=5s, then
+- `Revoke { resource }` -> drop the canonical from `held`, emit `Revoked`,
+  reply `Release` (the revoke-ack; the server waits <=5s, then
   force-reclaims and does NOT requeue).
-- `Grant` (unsolicited re-grant) -> `Ack` it (5s server timer), store the new
-  canonical, emit `Granted` with a fresh dup — no `acquire` needed.
+- `Grant { resource }` (unsolicited re-grant) -> `Ack` it (5s server timer),
+  store the new canonical, emit `Granted` with a fresh dup — no `acquire`
+  needed.
 - Disconnect (EOF/error) -> disown everything (drop canonicals, emit
   `Revoked` per held resource), return.
 
@@ -102,10 +104,10 @@ flowchart LR
     boot([app start]) --> conn["SgcClient::connect()<br/>connect + read Advertise"]
     conn --> chk{"server offers<br/>the resource?"}
     chk -- no --> giveup([give up or retry later])
-    chk -- yes --> acq["client.acquire(Fbdev)<br/>BLOCKS until the server answers"]
+    chk -- yes --> acq["client.acquire(Display(Fbdev))<br/>BLOCKS until the server answers"]
     acq -- Denied --> giveup
     acq -- Ok --> hold["client HOLDS the canonical fd"]
-    hold --> lend["fd = client.fd(&Fbdev)<br/>lend: fresh dup"]
+    hold --> lend["fd = client.fd(&Display(Fbdev))<br/>lend: fresh dup"]
     lend --> spawn["spawn render task<br/>first Draw with the dup"]
     spawn --> evloop["client.start_event_loop(on_event)<br/>BLOCKS until connection ends"]
     evloop -- Revoke --> revoke["drop canonical<br/>on_event(Revoked)<br/>reply Release"]
@@ -121,18 +123,24 @@ comes from a lend (`fd()`) or a `Granted` event, never from `acquire()`.
 
 ## App structure (the demos)
 
-- main thread: connect → check advertised resources → acquire (blocking) →
-  lend a dup → spawn render task → first `Draw` with the dup →
-  `start_event_loop` mapping `SgcEvent` → `RenderCmd` → send `Stop`/`Exit`,
-  drop sender, join.
+- main thread: connect → check advertised resources → acquire the display
+  (blocking) → lend a dup → spawn render task → first `Draw` with the dup →
+  acquire the first advertised mouse (one resource per message) → lend a dup
+  → spawn input task → `start_event_loop` mapping `SgcEvent` → `RenderCmd` /
+  `InputCmd` by resource → send `Stop`/`Exit`, drop senders, join.
 - render task: receives `RenderCmd` on an mpsc channel; builds the renderer
   from the first `Draw` fd (linfb is `!Send`, so it must be built there); owns
   its dup (drops it on `Stop`); redraws its cached scene on every `Draw`.
+- input task: receives `InputCmd` on an mpsc channel; watches the granted
+  mouse fd — a dup of the server's open of `/dev/input/eventN`, so events are
+  parsed straight off the fd (native-endian, no EVIOCGRAB — input is
+  broadcast to every open fd, shared visibility is the point); drops its dup
+  on `Stop`.
 - The demos render until killed: no `--hold`, no graceful release — the server
   frees the resource on disconnect.
 - `sgc-fbdev-client`: bouncing-rect scene; main + `logic` + `render` +
   `timer` (16ms logic / 33ms draw timers on one loop; `RenderCmd` adds
-  `Exit`).
+  `Exit`) + `input` (evdev mouse watcher).
 - `sgc-fbdev-client-2`: checkerboard scene; main + `render`.
 
 ## Renderer constraints (linfb)
@@ -198,13 +206,13 @@ B dies     -> A: re-granted -> drawing (fresh dup)
 
 - `release()` (voluntary hand-back) not implemented: check `held`, write
   `Release`, remove from `held` when it lands.
-- Multi-resource acquisition is one resource at a time (server denies
-  multi-resource Acquire anyway); `HashMap` + tagged events are the routing
-  for when that changes.
+- Multi-resource acquisition is one at a time — the protocol names exactly
+  one resource per message by design; `HashMap` + tagged events are the
+  routing for apps that hold several resources.
 
 ## Non-goals (v1)
 
-- Multi-resource `acquire` (server denies it anyway).
+- Multi-resource `acquire` (one resource per message by design).
 - Acquire timeout (a one-liner later — the reply is a direct read).
 - Non-blocking `acquire` (run the client on a worker thread instead).
 - Reconnect logic (session dies loudly; the app reconnects).

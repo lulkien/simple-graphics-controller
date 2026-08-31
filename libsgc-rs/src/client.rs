@@ -99,17 +99,22 @@ impl SgcClient {
     /// [`SgcClient::fd`]. On `Deny` nothing is held.
     pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError> {
         self.write_frame(&ClientRequest::Acquire {
-            resources: vec![resource.clone()],
+            resource: resource.clone(),
         })?;
 
         let (msg, fds) = read_framed(&mut self.stream)?;
         match msg {
-            ServerMessage::Grant { .. } => {
+            ServerMessage::Grant { resource: granted } => {
                 if fds.len() != 1 {
                     return Err(SgcError::Io(io::Error::new(
                         ErrorKind::InvalidData,
                         format!("grant carried {} fds, expected 1", fds.len()),
                     )));
+                }
+                if granted != resource {
+                    return Err(SgcError::UnexpectedMessage(ServerMessage::Grant {
+                        resource: granted,
+                    }));
                 }
                 // Safety: the fd arrived via SCM_RIGHTS, which transfers
                 // ownership to this process.
@@ -142,11 +147,11 @@ impl SgcClient {
     /// The client's event loop: block reading frames until the connection
     /// ends, calling `on_event` for each.
     ///
-    /// - `Revoke { resources }` -> drop the canonical fds, emit
-    ///   [`SgcEvent::Revoked`] for each, reply `Release` (the revoke-ack;
-    ///   the server waits up to 5s for it);
-    /// - `Grant` (the unsolicited re-grant) -> Ack it, store the canonical
-    ///   fd, emit [`SgcEvent::Granted`] with a dup;
+    /// - `Revoke { resource }` -> drop the canonical fd, emit
+    ///   [`SgcEvent::Revoked`], reply `Release` (the revoke-ack; the
+    ///   server waits up to 5s for it);
+    /// - `Grant { resource }` (the unsolicited re-grant) -> Ack it, store
+    ///   the canonical fd, emit [`SgcEvent::Granted`] with a dup;
     /// - disconnected -> disown everything (drop the canonicals, emit
     ///   `Revoked` for each), return.
     pub fn start_event_loop<F>(&mut self, mut on_event: F)
@@ -168,29 +173,22 @@ impl SgcClient {
                 }
             };
             match msg {
-                ServerMessage::Revoke { resources } => {
-                    for resource in &resources {
-                        println!("revoked {resource:?}; stopping render");
-                        // Drop the canonical; the borrower drops its dup
-                        // on Revoked.
-                        self.held.remove(resource);
-                        on_event(SgcEvent::Revoked {
-                            resource: resource.clone(),
-                        });
-                    }
+                ServerMessage::Revoke { resource } => {
+                    println!("revoked {resource:?}; stopping render");
+                    // Drop the canonical; the borrower drops its dup
+                    // on Revoked.
+                    self.held.remove(&resource);
+                    on_event(SgcEvent::Revoked {
+                        resource: resource.clone(),
+                    });
                     // Revoke-ack: Release doubles as the acknowledgment.
-                    let _ = self.write_frame(&ClientRequest::Release { resources });
+                    let _ = self.write_frame(&ClientRequest::Release { resource });
                 }
-                ServerMessage::Grant { resources } => {
+                ServerMessage::Grant { resource } => {
                     if fds.len() != 1 {
                         eprintln!("grant carried {} fds; ignoring", fds.len());
                         continue;
                     }
-                    let Some(resource) = resources.first() else {
-                        eprintln!("grant without resources; ignoring");
-                        continue;
-                    };
-                    let resource = resource.clone();
                     // Safety: SCM_RIGHTS transfers ownership to us.
                     let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
                     let _ = self.write_frame(&ClientRequest::Ack);
@@ -267,6 +265,7 @@ mod tests {
         thread,
     };
     use sendfd::SendWithFd;
+    use simple_graphics_protocol::DisplayResource;
 
     /// Minimal fake controller: bind an abstract listener, signal `ready`,
     /// accept one client, send `Advertise`, optionally reply with `reply`
@@ -283,7 +282,7 @@ mod tests {
             ready_tx.send(()).expect("ready signal");
             let (mut stream, _) = listener.accept().expect("accept");
             let adv = serialize_framed(&ServerMessage::Advertise {
-                available_resources: vec![Resource::Fbdev],
+                available_resources: vec![Resource::Display(DisplayResource::Fbdev)],
             })
             .expect("serialize advertise");
             stream.write_all(&adv).expect("write advertise");
@@ -324,7 +323,7 @@ mod tests {
         let (server, ready) = fake_server(b"sgc-test-adv", None);
         ready.recv().expect("server ready");
         let (client, available) = SgcClient::connect_at(b"sgc-test-adv").expect("connect");
-        assert_eq!(available, vec![Resource::Fbdev]);
+        assert_eq!(available, vec![Resource::Display(DisplayResource::Fbdev)]);
         assert!(client.held().is_empty());
         drop(client);
         server.join().expect("server thread finished");
@@ -343,7 +342,7 @@ mod tests {
         );
         ready.recv().expect("server ready");
         let (mut client, _) = SgcClient::connect_at(b"sgc-test-deny").expect("connect");
-        let err = client.acquire(Resource::Fbdev).expect_err("must be denied");
+        let err = client.acquire(Resource::Display(DisplayResource::Fbdev)).expect_err("must be denied");
         assert!(
             matches!(err, SgcError::Denied { ref reason } if reason == "first-owner policy"),
             "expected Denied, got {err:?}"
@@ -360,16 +359,16 @@ mod tests {
             b"sgc-test-grant",
             Some((
                 ServerMessage::Grant {
-                    resources: vec![Resource::Fbdev],
+                    resource: Resource::Display(DisplayResource::Fbdev),
                 },
                 Some(devnull.as_raw_fd()),
             )),
         );
         ready.recv().expect("server ready");
         let (mut client, _) = SgcClient::connect_at(b"sgc-test-grant").expect("connect");
-        client.acquire(Resource::Fbdev).expect("grant");
-        assert_eq!(client.held(), vec![Resource::Fbdev]);
-        let fd = client.fd(&Resource::Fbdev).expect("lend");
+        client.acquire(Resource::Display(DisplayResource::Fbdev)).expect("grant");
+        assert_eq!(client.held(), vec![Resource::Display(DisplayResource::Fbdev)]);
+        let fd = client.fd(&Resource::Display(DisplayResource::Fbdev)).expect("lend");
         assert!(fd.as_raw_fd() >= 0, "lent fd must be valid");
         drop(client);
         server.join().expect("server thread finished");

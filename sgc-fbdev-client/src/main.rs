@@ -11,13 +11,15 @@
 //! Multi-resource ready: one held fd per resource, one owner of the
 //! truth — the client.
 
+mod input;
 mod logic;
 mod render;
 mod timer;
 
 use std::{os::fd::OwnedFd, sync::mpsc, thread};
 
-use libsgc_rs::{Resource, SgcClient, SgcError, SgcEvent};
+use input::InputCmd;
+use libsgc_rs::{DisplayResource, InputResource, Resource, SgcClient, SgcError, SgcEvent};
 use render::RenderCmd;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,27 +37,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial grant.
     render_tx.send(RenderCmd::Draw {
-        resource: Resource::Fbdev,
+        resource: Resource::Display(DisplayResource::Fbdev),
         fd: fbdev_fd,
     })?;
 
-    // The client's event loop: revoke -> drop canonical + stop render,
-    // re-grant -> store canonical + draw with a fresh dup, disconnect ->
-    // disown everything. Blocks until the connection ends.
+    // The first mouse the server offers, if any. Acquire it and hand the
+    // fd to the input task, which logs mouse events.
+    let mouse = available.iter().find_map(|resource| match resource {
+        Resource::Input(InputResource::Mouse(index)) => {
+            Some(Resource::Input(InputResource::Mouse(*index)))
+        }
+        _ => None,
+    });
+
+    let (input_tx, input_rx) = mpsc::channel();
+    let input_handle = match mouse.clone() {
+        Some(mouse) => match client.acquire(mouse.clone()) {
+            Ok(()) => {
+                println!("granted {mouse:?}");
+                match client.fd(&mouse) {
+                    Ok(fd) => {
+                        let input = thread::spawn(move || input::run(input_rx));
+                        input_tx.send(InputCmd::Start { fd })?;
+                        Some(input)
+                    }
+                    Err(e) => {
+                        eprintln!("input lend failed: {e}");
+                        None
+                    }
+                }
+            }
+            Err(SgcError::Denied { reason }) => {
+                eprintln!("mouse denied: {reason}");
+                None
+            }
+            Err(e) => {
+                eprintln!("mouse acquire failed: {e}");
+                None
+            }
+        },
+        None => {
+            println!("no mouse advertised; skipping input");
+            None
+        }
+    };
+
+    // The client's event loop: revoke -> drop canonical + stop the owner
+    // task, re-grant -> store canonical + hand a fresh dup to the owner
+    // task, disconnect -> disown everything. Blocks until the connection
+    // ends. Events are routed by resource (display -> render, mouse ->
+    // input).
     client.start_event_loop(|event| match event {
         SgcEvent::Revoked { resource } => {
-            let _ = render_tx.send(RenderCmd::Stop { resource });
+            if Some(&resource) == mouse.as_ref() {
+                let _ = input_tx.send(InputCmd::Stop);
+            } else {
+                let _ = render_tx.send(RenderCmd::Stop { resource });
+            }
         }
         SgcEvent::Granted { resource, fd } => {
-            let _ = render_tx.send(RenderCmd::Draw { resource, fd });
+            if Some(&resource) == mouse.as_ref() {
+                let _ = input_tx.send(InputCmd::Start { fd });
+            } else {
+                let _ = render_tx.send(RenderCmd::Draw { resource, fd });
+            }
         }
     });
 
     let _ = render_tx.send(RenderCmd::Exit);
+    let _ = input_tx.send(InputCmd::Stop);
 
     drop(render_tx);
+    drop(input_tx);
 
     let _ = render_handle.join();
+    if let Some(input_handle) = input_handle {
+        let _ = input_handle.join();
+    }
 
     Ok(())
 }
@@ -63,14 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn acquire_display_fd(client: &mut SgcClient, available: &[Resource]) -> Result<OwnedFd, SgcError> {
     // Fail fast if the server does not offer Fbdev (e.g. no /dev/fb0 on
     // the host): an acquire would only be denied with a round trip.
-    if !available.contains(&Resource::Fbdev) {
+    if !available.contains(&Resource::Display(DisplayResource::Fbdev)) {
         eprintln!("server does not offer Fbdev; available: {available:?}");
         return Err(SgcError::NotAvailable {
-            resource: Resource::Fbdev,
+            resource: Resource::Display(DisplayResource::Fbdev),
         });
     }
 
-    match client.acquire(Resource::Fbdev) {
+    match client.acquire(Resource::Display(DisplayResource::Fbdev)) {
         Ok(()) => println!("granted Fbdev (client holds fd)"),
         Err(SgcError::Denied { reason }) => {
             eprintln!("denied: {reason}");
@@ -84,7 +142,7 @@ fn acquire_display_fd(client: &mut SgcClient, available: &[Resource]) -> Result<
     println!("held: {:?}", client.held());
 
     // Borrow a dup for the render task; the client keeps the canonical.
-    match client.fd(&Resource::Fbdev) {
+    match client.fd(&Resource::Display(DisplayResource::Fbdev)) {
         Ok(fd) => Ok(fd),
         Err(e) => {
             eprintln!("lend failed: {e}");
