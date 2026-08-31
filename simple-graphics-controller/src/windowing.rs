@@ -127,10 +127,10 @@ pub const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub enum ControlMessage {
     /// Evict the client: write `ServerMessage::Revoke` on the wire.
-    Revoke { resources: Vec<Resource> },
+    Revoke { resource: Resource },
     /// The client is granted (after being queued or requeued): write
-    /// `ServerMessage::Grant` with the matching fds on the wire.
-    Grant { resources: Vec<Resource> },
+    /// `ServerMessage::Grant` with the matching fd on the wire.
+    Grant { resource: Resource },
 }
 
 /// Outcome of an `Acquire` request.
@@ -379,7 +379,7 @@ fn handle_command(
                     {
                         if let Some(control) = control_reg.get(&owner) {
                             let _ = control.send(ControlMessage::Revoke {
-                                resources: vec![resource.clone()],
+                                resource: resource.clone(),
                             });
                             slot.revoke_deadline = Some(Instant::now() + REVOKE_TIMEOUT);
                             info!(
@@ -440,7 +440,7 @@ fn grant_next(
             Some(control)
                 if control
                     .send(ControlMessage::Grant {
-                        resources: vec![resource.clone()],
+                        resource: resource.clone(),
                     })
                     .is_ok() =>
             {
@@ -574,11 +574,12 @@ mod tests {
 #[cfg(test)]
 mod engine_tests {
     use super::*;
+    use simple_graphics_protocol::DisplayResource;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
     fn fbdev() -> Resource {
-        Resource::Fbdev
+        Resource::Display(DisplayResource::Fbdev)
     }
 
     fn cid(n: u64) -> ClientId {
@@ -644,13 +645,13 @@ mod engine_tests {
         // A is told to leave.
         assert!(matches!(
             next_control(&mut a).await,
-            ControlMessage::Revoke { resources } if resources == vec![fbdev()]
+            ControlMessage::Revoke { resource } if resource == fbdev()
         ));
         // A's revoke-ack Release hands the resource to B.
         engine.release(cid(1), fbdev()).await;
         assert!(matches!(
             next_control(&mut b).await,
-            ControlMessage::Grant { resources } if resources == vec![fbdev()]
+            ControlMessage::Grant { resource } if resource == fbdev()
         ));
     }
 

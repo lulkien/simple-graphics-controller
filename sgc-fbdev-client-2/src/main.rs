@@ -16,7 +16,7 @@ mod render;
 
 use std::{sync::mpsc, thread};
 
-use libsgc_rs::{Resource, SgcClient, SgcError, SgcEvent};
+use libsgc_rs::{Resource, DisplayResource, SgcClient, SgcError, SgcEvent};
 use render::RenderCmd;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,14 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fail fast if the server does not offer Fbdev (e.g. no /dev/fb0 on
     // the host): an acquire would only be denied with a round trip.
-    if !available.contains(&Resource::Fbdev) {
+    if !available.contains(&Resource::Display(DisplayResource::Fbdev)) {
         eprintln!("server does not offer Fbdev; available: {available:?}");
         return Ok(());
     }
 
     // Request the resource (blocking; queued requests block here). The
     // client now owns the canonical fd.
-    match client.acquire(Resource::Fbdev) {
+    match client.acquire(Resource::Display(DisplayResource::Fbdev)) {
         Ok(()) => println!("granted Fbdev (client holds fd)"),
         Err(SgcError::Denied { reason }) => {
             eprintln!("denied: {reason}");
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("held: {:?}", client.held());
 
     // Borrow a dup for the render task; the client keeps the canonical.
-    let fd = match client.fd(&Resource::Fbdev) {
+    let fd = match client.fd(&Resource::Display(DisplayResource::Fbdev)) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("lend failed: {e}");
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (render_tx, render_rx) = mpsc::channel();
     let render = thread::spawn(move || render::run(render_rx));
     render_tx.send(RenderCmd::Draw {
-        resource: Resource::Fbdev,
+        resource: Resource::Display(DisplayResource::Fbdev),
         fd,
     })?;
 
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let _ = render_tx.send(RenderCmd::Stop {
-        resource: Resource::Fbdev,
+        resource: Resource::Display(DisplayResource::Fbdev),
     });
     drop(render_tx);
     let _ = render.join();

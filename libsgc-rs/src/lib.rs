@@ -19,4 +19,4 @@ pub mod error;
 
 pub use client::{SgcClient, SgcEvent};
 pub use error::SgcError;
-pub use simple_graphics_protocol::Resource;
+pub use simple_graphics_protocol::{DisplayResource, InputResource, Resource};

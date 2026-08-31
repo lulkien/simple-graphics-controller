@@ -1,5 +1,5 @@
 use simple_graphics_protocol::{
-    ClientRequest, Resource, ServerMessage, serialize, serialize_framed,
+    ClientRequest, Resource, DisplayResource, ServerMessage, serialize, serialize_framed,
 };
 
 fn main() {
@@ -7,14 +7,14 @@ fn main() {
         (
             "Acquire{Fbdev}".into(),
             serialize(&ClientRequest::Acquire {
-                resources: vec![Resource::Fbdev],
+                resource: Resource::Display(DisplayResource::Fbdev),
             })
             .unwrap(),
         ),
         (
             "Release{Fbdev}".into(),
             serialize(&ClientRequest::Release {
-                resources: vec![Resource::Fbdev],
+                resource: Resource::Display(DisplayResource::Fbdev),
             })
             .unwrap(),
         ),
@@ -25,14 +25,14 @@ fn main() {
         (
             "Advertise{[Fbdev]}".into(),
             serialize(&ServerMessage::Advertise {
-                available_resources: vec![Resource::Fbdev],
+                available_resources: vec![Resource::Display(DisplayResource::Fbdev)],
             })
             .unwrap(),
         ),
         (
-            "Grant{[Fbdev]}".into(),
+            "Grant{Fbdev}".into(),
             serialize(&ServerMessage::Grant {
-                resources: vec![Resource::Fbdev],
+                resource: Resource::Display(DisplayResource::Fbdev),
             })
             .unwrap(),
         ),
@@ -55,7 +55,7 @@ fn main() {
 
     // Sanity: serialize_framed produces the same bytes as manual framing.
     let framed = serialize_framed(&ServerMessage::Grant {
-        resources: vec![Resource::Fbdev],
+        resource: Resource::Display(DisplayResource::Fbdev),
     })
     .unwrap();
     let mut manual = Vec::with_capacity(4 + cases[3].1.len());

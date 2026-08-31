@@ -7,25 +7,48 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A resource that can be managed by the server.
+/// A resource that can be managed by the server, grouped by kind.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Resource {
-    /// The framebuffer device resource.
+    /// A display/output device.
+    Display(DisplayResource),
+    /// An input device.
+    Input(InputResource),
+}
+
+/// Display resources.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DisplayResource {
+    /// The framebuffer device (/dev/fb0).
     Fbdev,
+    /// A DRM render/display card (/dev/dri/cardN).
+    Drm { card: u8 },
+}
+
+/// Input resources. The index counts devices of the same class, so the
+/// registry can hold several mice/keyboards/touchscreens at once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum InputResource {
+    /// A mouse-like device (relative axes + buttons).
+    Mouse(u8),
+    /// A keyboard-like device (key codes).
+    Keyboard(u8),
+    /// A touch device (absolute axes, single- or multi-touch).
+    Touch(u8),
 }
 
 /// A request sent from a client to the server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientRequest {
-    /// Requests ownership of one or more resources.
+    /// Requests ownership of one resource.
     Acquire {
-        /// The resources the client wants to acquire.
-        resources: Vec<Resource>,
+        /// The resource the client wants to acquire.
+        resource: Resource,
     },
-    /// Releases one or more resources previously acquired by the client.
+    /// Releases one resource previously acquired by the client.
     Release {
-        /// The resources the client wants to release.
-        resources: Vec<Resource>,
+        /// The resource the client wants to release.
+        resource: Resource,
     },
     /// Acknowledges receipt of a [`ServerMessage::Grant`] and its file
     /// descriptors. The server waits for this within a timeout after
@@ -44,17 +67,17 @@ pub enum ServerMessage {
     },
     /// Grants the client's resource request.
     Grant {
-        /// Resources has been granted for the client.
-        resources: Vec<Resource>,
+        /// The resource granted for the client, with one fd.
+        resource: Resource,
     },
     /// Denies the client's request.
     Deny {
         /// Human-readable explanation for why the request was denied.
         reason: String,
     },
-    /// Revokes resources previously granted to the client.
+    /// Revokes a resource previously granted to the client.
     Revoke {
-        /// Resources the client must release.
-        resources: Vec<Resource>,
+        /// The resource the client must release.
+        resource: Resource,
     },
 }

@@ -191,20 +191,20 @@ async fn dispatch_request(
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     match req {
-        ClientRequest::Acquire { resources } => {
+        ClientRequest::Acquire { resource } => {
             handle_acquire(
                 stream,
                 client_id,
                 client_pid,
-                resources,
+                resource,
                 engine,
                 resource_reg,
                 ack_deadline,
             )
             .await?;
         }
-        ClientRequest::Release { resources } => {
-            handle_release(client_id, resources, engine).await;
+        ClientRequest::Release { resource } => {
+            handle_release(client_id, resource, engine).await;
         }
         ClientRequest::Ack => {
             info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
@@ -224,13 +224,13 @@ async fn process_control_message(
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     match msg {
-        ControlMessage::Revoke { resources } => {
-            info!("[client {client_id} (pid {client_pid})] Revoking {resources:?}");
-            let resp = serialize_framed(&ServerMessage::Revoke { resources })?;
+        ControlMessage::Revoke { resource } => {
+            info!("[client {client_id} (pid {client_pid})] Revoking {resource:?}");
+            let resp = serialize_framed(&ServerMessage::Revoke { resource })?;
             stream.write_all(&resp).await.map_err(ServerError::Write)?;
         }
-        ControlMessage::Grant { resources } => {
-            send_grant(stream, client_id, client_pid, resources, resource_reg).await?;
+        ControlMessage::Grant { resource } => {
+            send_grant(stream, client_id, client_pid, resource, resource_reg).await?;
             *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
         }
     }
@@ -245,35 +245,16 @@ async fn handle_acquire(
     stream: &mut UnixStream,
     client_id: ClientId,
     client_pid: pid_t,
-    resources: Vec<Resource>,
+    resource: Resource,
     engine: &PolicyEngine,
     resource_reg: &ResourceRegistry,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
-    info!("[client {client_id} (pid {client_pid})] Acquire: {resources:?}");
-
-    // v1: single resource per Acquire. All-or-nothing multi-resource grants
-    // with queues can deadlock (A holds fb0 waits fb1, B holds fb1 waits
-    // fb0); revisit when multi-resource is actually needed.
-    let [resource] = resources.as_slice() else {
-        let reason = "multi-resource acquire is not supported (one resource per Acquire)";
-        let resp = serialize_framed(&ServerMessage::Deny {
-            reason: reason.into(),
-        })?;
-        stream.write_all(&resp).await.map_err(ServerError::Write)?;
-        return Ok(());
-    };
+    info!("[client {client_id} (pid {client_pid})] Acquire: {resource:?}");
 
     match engine.acquire(client_id, resource.clone()).await {
         AcquireOutcome::Granted => {
-            send_grant(
-                stream,
-                client_id,
-                client_pid,
-                vec![resource.clone()],
-                resource_reg,
-            )
-            .await?;
+            send_grant(stream, client_id, client_pid, resource, resource_reg).await?;
             *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
         }
         AcquireOutcome::Queued => {
@@ -291,30 +272,23 @@ async fn handle_acquire(
     Ok(())
 }
 
-/// Send `ServerMessage::Grant` with one fd per resource, in order.
+/// Send `ServerMessage::Grant` for one resource, with its fd.
 async fn send_grant(
     stream: &mut UnixStream,
     client_id: ClientId,
     client_pid: pid_t,
-    resources: Vec<Resource>,
+    resource: Resource,
     resource_reg: &ResourceRegistry,
 ) -> ServerResult<()> {
-    let mut grant_fds: Vec<RawFd> = Vec::new();
-    for resource in &resources {
-        let fd = resource_reg
-            .get(resource)
-            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
-            .as_raw_fd();
-        grant_fds.push(fd);
-    }
+    let fd = resource_reg
+        .get(&resource)
+        .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
+        .as_raw_fd();
 
-    info!(
-        "[client {client_id} (pid {client_pid})] Granted {resources:?} ({} fd(s))",
-        grant_fds.len()
-    );
-    let response = serialize_framed(&ServerMessage::Grant { resources })?;
+    info!("[client {client_id} (pid {client_pid})] Granted {resource:?} (fd {fd})");
+    let response = serialize_framed(&ServerMessage::Grant { resource })?;
     stream
-        .send_with_fd(&response, &grant_fds)
+        .send_with_fd(&response, &[fd])
         .map_err(ServerError::Write)?;
     Ok(())
 }
@@ -322,8 +296,6 @@ async fn send_grant(
 /// Forward a Release to the engine. The engine validates ownership (a
 /// Release from a non-owner, or one that completes a revoke, is its call —
 /// it warns and requeues accordingly).
-async fn handle_release(client_id: ClientId, resources: Vec<Resource>, engine: &PolicyEngine) {
-    for resource in resources {
-        engine.release(client_id, resource).await;
-    }
+async fn handle_release(client_id: ClientId, resource: Resource, engine: &PolicyEngine) {
+    engine.release(client_id, resource).await;
 }
