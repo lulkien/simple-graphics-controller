@@ -109,6 +109,15 @@ The index counts devices of the same class (`Mouse(0)`, `Mouse(1)`, ...) so
 the registry can hold several at once. Input devices come from
 `/dev/input/event*`, classified by capabilities (touch > mouse > keyboard).
 
+**DRM**: the server registers every card that can present a display — has
+display connectors (writeback connectors are capture-only and don't count) —
+one `Drm { card }` per physical `/dev/dri/cardN`. Render nodes
+(`renderDNN`) are never registered. `Advertise` lists the cards in priority
+order: a card with a connected connector first, then the lowest index — so
+the first `Drm` entry is the best display card. A client that wants "a
+screen" takes the first `Drm` in the list; one that wants a specific card
+names it.
+
 `{"Display": "Fbdev"}` wire hex:
 `81 a7 44 69 73 70 6c 61 79 a5 46 62 64 65 76`.
 

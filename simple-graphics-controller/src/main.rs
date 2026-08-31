@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     os::{linux::net::SocketAddrExt, unix::net::SocketAddr, unix::net::UnixListener as StdUnixListener},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{
@@ -41,14 +44,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting simple-graphics-controller");
-    let resource_reg = query_resource();
-    debug!(
-        "Registered resources: {:?}",
-        resource_reg
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect::<Vec<_>>()
-    );
+    let (resource_reg, advertised) = query_resource();
+    let advertised = Arc::new(advertised);
+    debug!("Advertised resources (priority order): {advertised:?}");
 
     // Window policy: SGC_POLICY env, default fair-queue. One policy for all
     // registered resources (per-resource override map is a future knob).
@@ -97,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let engine = engine.clone();
                 let resource_reg = resource_reg.clone();
+                let advertised = advertised.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         stream,
@@ -104,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
                         client_pid,
                         engine.clone(),
                         resource_reg.clone(),
+                        advertised,
                     )
                     .await
                     {

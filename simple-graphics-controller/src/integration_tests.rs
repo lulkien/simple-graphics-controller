@@ -165,6 +165,7 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     let file = std::fs::File::open("/dev/null").expect("/dev/null");
     resource_reg.insert(Resource::Display(DisplayResource::Fbdev), file.into());
+    let advertised = Arc::new(vec![Resource::Display(DisplayResource::Fbdev)]);
 
     let engine = PolicyEngine::spawn(std::collections::HashMap::from([(Resource::Display(DisplayResource::Fbdev), policy)]));
 
@@ -186,9 +187,10 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
             let client_id = ClientId::new(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
             let engine = engine.clone();
             let resource_reg = resource_reg.clone();
+            let advertised = advertised.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_connection(stream, client_id, creds.pid(), engine, resource_reg).await
+                    handle_connection(stream, client_id, creds.pid(), engine, resource_reg, advertised).await
                 {
                     eprintln!("handler error: {e:#}");
                 }

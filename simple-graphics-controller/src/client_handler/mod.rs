@@ -9,7 +9,7 @@ mod control;
 mod requests;
 mod wire;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::error::{ServerError, ServerResult};
 use crate::types::{ClientId, ResourceRegistry};
@@ -30,6 +30,7 @@ pub async fn handle_connection(
     client_pid: pid_t,
     engine: PolicyEngine,
     resource_reg: ResourceRegistry,
+    advertised: Arc<Vec<Resource>>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] New client connected");
 
@@ -38,11 +39,9 @@ pub async fn handle_connection(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     engine.register(client_id, control_tx).await;
 
-    // Send available resources immediately (no Hello handshake needed).
-    let available_resources: Vec<Resource> = resource_reg
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect();
+    // Send available resources immediately (no Hello handshake needed). The
+    // list carries the discovery priority order — first is best.
+    let available_resources = advertised.as_ref().clone();
     let res = serialize_framed(&ServerMessage::Advertise {
         available_resources: available_resources.clone(),
     })?;
