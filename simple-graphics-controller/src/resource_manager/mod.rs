@@ -12,11 +12,7 @@
 mod display;
 mod input;
 
-use std::{
-    fs::File,
-    os::fd::AsRawFd,
-    sync::Arc,
-};
+use std::{fs::File, os::fd::AsRawFd, sync::Arc};
 
 use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
@@ -56,6 +52,10 @@ fn open_input_devices(resource_reg: ResourceRegistry, advertised: &mut Vec<Resou
         let fd = file.as_raw_fd();
         resource_reg.insert(resource.clone(), file.into());
         advertised.push(resource.clone());
-        info!("Opened {} ({}): {resource:?} (fd {fd})", device.path.display(), device.name);
+        info!(
+            "Opened {} ({}): {resource:?} (fd {fd})",
+            device.path.display(),
+            device.name
+        );
     }
 }

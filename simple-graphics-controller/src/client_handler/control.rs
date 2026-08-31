@@ -9,8 +9,8 @@ use simple_graphics_protocol::{ServerMessage, serialize_framed};
 use tokio::{io::AsyncWriteExt, net::UnixStream, time::Instant};
 use tracing::info;
 
-use super::requests::send_grant;
 use super::GRANT_ACK_TIMEOUT;
+use super::requests::send_grant;
 
 pub(super) async fn process_control_message(
     stream: &mut UnixStream,

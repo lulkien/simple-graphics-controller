@@ -1,7 +1,4 @@
-use std::{
-    os::fd::OwnedFd,
-    sync::Arc,
-};
+use std::{os::fd::OwnedFd, sync::Arc};
 
 use dashmap::DashMap;
 use simple_graphics_protocol::Resource;

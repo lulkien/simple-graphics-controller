@@ -5,13 +5,13 @@
 
 use std::io::ErrorKind;
 
-use crate::error::ServerResult;
-use crate::types::{ClientId, ResourceRegistry};
-use crate::windowing::PolicyEngine;
-use nix::libc::pid_t;
-use simple_graphics_protocol::{
-    ClientRequest, FRAME_HEADER_LEN, deserialize, parse_frame_header,
+use crate::{
+    error::ServerResult,
+    types::{ClientId, ResourceRegistry},
+    windowing::PolicyEngine,
 };
+use nix::libc::pid_t;
+use simple_graphics_protocol::{ClientRequest, FRAME_HEADER_LEN, deserialize, parse_frame_header};
 use tokio::{net::UnixStream, time::Instant};
 use tracing::{debug, trace};
 

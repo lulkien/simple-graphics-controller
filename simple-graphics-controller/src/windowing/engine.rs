@@ -235,9 +235,7 @@ fn acquire_one(
         }
         AcquireDecision::RevokeAndQueue | AcquireDecision::Queue => {
             if slot.is_queued(client) {
-                debug!(
-                    "[client {client}] already queued for {resource:?}; keeping position"
-                );
+                debug!("[client {client}] already queued for {resource:?}; keeping position");
                 return AcquireOutcome::Queued;
             }
             slot.waiters.push_back(Waiter { client });

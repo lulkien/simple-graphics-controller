@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use sendfd::RecvWithFd;
 use simple_graphics_protocol::{
-    ClientRequest, FRAME_HEADER_LEN, Resource, DisplayResource, ServerMessage, deserialize,
+    ClientRequest, DisplayResource, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize,
     parse_frame_header, serialize_framed,
 };
 use tokio::{
@@ -167,7 +167,10 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
     resource_reg.insert(Resource::Display(DisplayResource::Fbdev), file.into());
     let advertised = Arc::new(vec![Resource::Display(DisplayResource::Fbdev)]);
 
-    let engine = PolicyEngine::spawn(std::collections::HashMap::from([(Resource::Display(DisplayResource::Fbdev), policy)]));
+    let engine = PolicyEngine::spawn(std::collections::HashMap::from([(
+        Resource::Display(DisplayResource::Fbdev),
+        policy,
+    )]));
 
     let addr = StdSocketAddr::from_abstract_name(name).expect("invalid abstract address");
     let std_listener = StdUnixListener::bind_addr(&addr).expect("bind");
@@ -189,8 +192,15 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
             let resource_reg = resource_reg.clone();
             let advertised = advertised.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(stream, client_id, creds.pid(), engine, resource_reg, advertised).await
+                if let Err(e) = handle_connection(
+                    stream,
+                    client_id,
+                    creds.pid(),
+                    engine,
+                    resource_reg,
+                    advertised,
+                )
+                .await
                 {
                     eprintln!("handler error: {e:#}");
                 }
@@ -203,7 +213,10 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
 async fn first_client_is_granted() {
     spawn_server(b"sgc-test-1", Policy::FairQueue).await;
     let mut a = TestClient::connect(b"sgc-test-1").await;
-    assert_eq!(a.expect_advertise().await, vec![Resource::Display(DisplayResource::Fbdev)]);
+    assert_eq!(
+        a.expect_advertise().await,
+        vec![Resource::Display(DisplayResource::Fbdev)]
+    );
     a.send(&ClientRequest::Acquire {
         resource: Resource::Display(DisplayResource::Fbdev),
     })
