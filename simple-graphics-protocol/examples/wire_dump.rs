@@ -58,9 +58,9 @@ fn main() {
         resource: Resource::Display(DisplayResource::Fbdev),
     })
     .unwrap();
-    let mut manual = Vec::with_capacity(4 + cases[3].1.len());
-    manual.extend_from_slice(&(cases[3].1.len() as u32).to_be_bytes());
-    manual.extend_from_slice(&cases[3].1);
+    let mut manual = Vec::with_capacity(4 + cases[4].1.len());
+    manual.extend_from_slice(&(cases[4].1.len() as u32).to_be_bytes());
+    manual.extend_from_slice(&cases[4].1);
     assert_eq!(framed, manual);
     println!("serialize_framed matches manual framing: yes");
 }
