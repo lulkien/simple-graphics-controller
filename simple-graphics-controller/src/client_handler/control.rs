@@ -8,7 +8,9 @@ use crate::{
     windowing::ControlMessage,
 };
 use nix::libc::pid_t;
-use simple_graphics_protocol::{Resource, ServerMessage, serialize_framed};
+#[cfg(feature = "drm")]
+use simple_graphics_protocol::Resource;
+use simple_graphics_protocol::{ServerMessage, serialize_framed};
 use tokio::{io::AsyncWriteExt, net::UnixStream, time::Instant};
 use tracing::info;
 
@@ -29,6 +31,7 @@ pub(super) async fn process_control_message(
             // before the client is even told — a misbehaving client that
             // keeps its fd open must not be able to keep the card.
             // (Fbdev/Input have no such mechanism; they are cooperative.)
+            #[cfg(feature = "drm")]
             if matches!(resource, Resource::Drm { .. })
                 && let Some(device) = registries.drm.get(&resource)
             {

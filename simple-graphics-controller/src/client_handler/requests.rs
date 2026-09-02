@@ -119,6 +119,7 @@ pub(super) async fn send_grant(
 /// dup of the server's registered fd.
 fn grant_fd(resource: &Resource, registries: &ResourceRegistries) -> anyhow::Result<OwnedFd> {
     match resource {
+        #[cfg(feature = "drm")]
         Resource::Drm { .. } => {
             let device = registries
                 .drm
@@ -148,10 +149,13 @@ pub(super) async fn handle_release(
     engine: &PolicyEngine,
     registries: &ResourceRegistries,
 ) {
+    #[cfg(feature = "drm")]
     if matches!(resource, Resource::Drm { .. })
         && let Some(device) = registries.drm.get(&resource)
     {
         device.revoke_lease();
     }
+    #[cfg(not(feature = "drm"))]
+    let _ = &registries;
     engine.release(client_id, resource).await;
 }

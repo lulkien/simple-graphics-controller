@@ -1,7 +1,11 @@
-//! Display resources: fbdev (`/dev/fb0`) and DRM cards (`/dev/dri/cardN`).
+//! DRM backend: open display-capable cards (`/dev/dri/cardN`) as DRM master
+//! and register each as `Resource::Drm { card }`.
 //!
-//! Registration order IS the advertised priority order (first is best): the
-//! DRM card selection logic lives here with the open.
+//! Compiled only with the `drm` feature (default). The master fd never
+//! leaves the server: every grant creates a FRESH lease over the card's
+//! objects (see [`DrmDevice::grant_lease`]) and revocation is
+//! kernel-enforced. Registration order IS the advertised priority order
+//! (first is best): the card selection logic lives here with the open.
 
 use std::{
     fs::{File, read_dir},
@@ -22,25 +26,6 @@ use drm::control::{
 use nix::fcntl::OFlag;
 use simple_graphics_protocol::Resource;
 use tracing::{debug, error, info};
-
-use crate::types::ResourceRegistry;
-
-/// Open `/dev/fb0` and register it as `Resource::Fbdev`.
-pub(super) fn open_fbdev(resource_reg: ResourceRegistry, advertised: &mut Vec<Resource>) {
-    match File::options().read(true).write(true).open("/dev/fb0") {
-        Ok(file) => {
-            let fd = file.as_raw_fd();
-            let resource = Resource::Fbdev;
-            resource_reg.insert(resource.clone(), file.into());
-            advertised.push(resource);
-            info!("Opened /dev/fb0");
-            debug!("Registered resource Fbdev (fd {fd})");
-        }
-        Err(e) => {
-            error!("Failed to open /dev/fb0: {e}");
-        }
-    }
-}
 
 /// The server's DRM master handle for one card: a plain fd wrapper that
 /// implements the `drm` crate's `Device` traits (the crate deliberately
@@ -130,9 +115,10 @@ impl DrmDevice {
         let objects: Vec<RawResourceHandle> = self
             .crtcs
             .iter()
-            .map(|handle| (*handle).into())
-            .chain(self.connectors.iter().map(|handle| (*handle).into()))
-            .chain(self.planes.iter().map(|handle| (*handle).into()))
+            .copied()
+            .map(RawResourceHandle::from)
+            .chain(self.connectors.iter().copied().map(RawResourceHandle::from))
+            .chain(self.planes.iter().copied().map(RawResourceHandle::from))
             .collect();
 
         let (lease_id, fd) = self.card.create_lease(&objects, 0)?;
@@ -174,7 +160,7 @@ impl DrmDevice {
 /// created per grant (see [`DrmDevice::grant_lease`]) and revoked when the
 /// client releases the resource, so the server can reclaim the card at any
 /// time — enforced by the kernel, no client cooperation needed.
-pub(super) fn open_drm_devices(drm_reg: DrmRegistry, advertised: &mut Vec<Resource>) {
+pub(super) fn open_devices(drm_reg: DrmRegistry, advertised: &mut Vec<Resource>) {
     let entries = match read_dir("/dev/dri/") {
         Ok(entries) => entries,
         Err(e) => {

@@ -166,10 +166,13 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     let file = std::fs::File::open("/dev/null").expect("/dev/null");
     resource_reg.insert(Resource::Fbdev, file.into());
+    #[cfg(feature = "drm")]
+    let drm_registry = Arc::new(DashMap::new());
     // No DRM cards on test hosts; the lease registry stays empty.
     let registries = ResourceRegistries {
         fds: resource_reg,
-        drm: Arc::new(DashMap::new()),
+        #[cfg(feature = "drm")]
+        drm: drm_registry,
     };
     let advertised = Arc::new(vec![Resource::Fbdev]);
 

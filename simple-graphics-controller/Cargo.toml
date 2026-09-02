@@ -3,6 +3,16 @@ name = "simple-graphics-controller"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Backends are compile-time features: a build includes exactly the backends
+# it was compiled with. The protocol crate is deliberately ungated — an
+# unbuilt backend is simply never advertised, and Acquires against it are
+# denied "not registered". See docs/resource-manager.md.
+default = ["drm", "input"]
+fbdev = []
+drm = ["dep:drm"]
+input = ["dep:evdev"]
+
 [dependencies]
 simple-graphics-protocol = { path = "../simple-graphics-protocol" }
 tokio = { version = "1", features = ["full"] }
@@ -13,8 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0.104"
 thiserror = "1"
-evdev = "0.12"
-drm = "0.15"
+evdev = { version = "0.12", optional = true }
+drm = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
