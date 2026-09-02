@@ -40,7 +40,7 @@ fds and lends them out. The app never touches the canonical fd.
     impl SgcClient {
         pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
             // connect + read Advertise; the advertised list lets the app
-            // fail fast ("server does not offer Display(Fbdev)") without a
+            // fail fast ("server does not offer the resource") without a
             // Deny round trip.
         pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError>;
             // write Acquire -> read Grant -> Ack -> store the canonical in `held`.
@@ -104,10 +104,10 @@ flowchart LR
     boot([app start]) --> conn["SgcClient::connect()<br/>connect + read Advertise"]
     conn --> chk{"server offers<br/>the resource?"}
     chk -- no --> giveup([give up or retry later])
-    chk -- yes --> acq["client.acquire(Display(Fbdev))<br/>BLOCKS until the server answers"]
+    chk -- yes --> acq["client.acquire(Resource::Fbdev)<br/>BLOCKS until the server answers"]
     acq -- Denied --> giveup
     acq -- Ok --> hold["client HOLDS the canonical fd"]
-    hold --> lend["fd = client.fd(&Display(Fbdev))<br/>lend: fresh dup"]
+    hold --> lend["fd = client.fd(&Resource::Fbdev)<br/>lend: fresh dup"]
     lend --> spawn["spawn render task<br/>first Draw with the dup"]
     spawn --> evloop["client.start_event_loop(on_event)<br/>BLOCKS until connection ends"]
     evloop -- Revoke --> revoke["drop canonical<br/>on_event(Revoked)<br/>reply Release"]

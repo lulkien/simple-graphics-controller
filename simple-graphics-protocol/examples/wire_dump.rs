@@ -1,5 +1,5 @@
 use simple_graphics_protocol::{
-    ClientRequest, Resource, ServerMessage, serialize, serialize_framed,
+    ClientRequest, InputResource, Resource, ServerMessage, serialize, serialize_framed,
 };
 
 fn main() {
@@ -12,24 +12,49 @@ fn main() {
             .unwrap(),
         ),
         (
-            "Release{Fbdev}".into(),
+            "Acquire{Drm0}".into(),
+            serialize(&ClientRequest::Acquire {
+                resource: Resource::Drm { card: 0 },
+            })
+            .unwrap(),
+        ),
+        (
+            "Acquire{InputMouse1}".into(),
+            serialize(&ClientRequest::Acquire {
+                resource: Resource::Input(InputResource::Mouse(1)),
+            })
+            .unwrap(),
+        ),
+        (
+            "Release{Drm0}".into(),
             serialize(&ClientRequest::Release {
-                resource: Resource::Fbdev,
+                resource: Resource::Drm { card: 0 },
             })
             .unwrap(),
         ),
         ("Ack".into(), serialize(&ClientRequest::Ack).unwrap()),
         (
-            "Advertise{[Fbdev]}".into(),
+            "Advertise{[Drm0,Fbdev]}".into(),
             serialize(&ServerMessage::Advertise {
-                available_resources: vec![Resource::Fbdev],
+                available_resources: vec![
+                    Resource::Drm { card: 0 },
+                    Resource::Fbdev,
+                    Resource::Input(InputResource::Mouse(0)),
+                ],
             })
             .unwrap(),
         ),
         (
-            "Grant{Fbdev}".into(),
+            "Grant{Drm0}".into(),
             serialize(&ServerMessage::Grant {
-                resource: Resource::Fbdev,
+                resource: Resource::Drm { card: 0 },
+            })
+            .unwrap(),
+        ),
+        (
+            "Revoke{Drm0}".into(),
+            serialize(&ServerMessage::Revoke {
+                resource: Resource::Drm { card: 0 },
             })
             .unwrap(),
         ),
@@ -47,21 +72,21 @@ fn main() {
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(payload);
         println!(
-            "{name:20} payload len={:3}  {}",
+            "{name:22} payload len={:3}  {}",
             payload.len(),
             hex(payload)
         );
-        println!("{name:20} framed  len={:3}  {}", framed.len(), hex(&framed));
+        println!("{name:22} framed  len={:3}  {}", framed.len(), hex(&framed));
     }
 
     // Sanity: serialize_framed produces the same bytes as manual framing.
     let framed = serialize_framed(&ServerMessage::Grant {
-        resource: Resource::Fbdev,
+        resource: Resource::Drm { card: 0 },
     })
     .unwrap();
-    let mut manual = Vec::with_capacity(4 + cases[4].1.len());
-    manual.extend_from_slice(&(cases[4].1.len() as u32).to_be_bytes());
-    manual.extend_from_slice(&cases[4].1);
+    let mut manual = Vec::with_capacity(4 + cases[6].1.len());
+    manual.extend_from_slice(&(cases[6].1.len() as u32).to_be_bytes());
+    manual.extend_from_slice(&cases[6].1);
     assert_eq!(framed, manual);
     println!("serialize_framed matches manual framing: yes");
 }

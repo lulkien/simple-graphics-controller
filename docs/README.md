@@ -2,20 +2,23 @@
 
 Graphics resource controller for Linux. A daemon owns graphics resources and
 hands them out to clients over an abstract Unix socket (`@sgc`); a client
-library plus a framebuffer demo client draw via `linfb`.
+library plus demo clients draw via the granted fd (fbdev mmap or a DRM lease).
 
 > Paths in this document are relative to the repository root.
 
 ## Workspace layout
 
-| crate                      | description                                        |
-| -------------------------- | -------------------------------------------------- |
+| crate                        | description                                        |
+| ---------------------------- | -------------------------------------------------- |
 | `simple-graphics-controller` | daemon: owns resources, serves clients on `@sgc`   |
 | `simple-graphics-protocol`   | shared protocol: messages, serialization (msgpack) |
+| `libsgc-rs`                  | client library: connect, acquire, revoke/regrant   |
+| `sgc-drm-client`             | demo client: acquires a DRM card, modesets on it   |
 | `sgc-fbdev-client`           | demo client: acquires the fbdev resource, draws    |
+| `sgc-fbdev-client-2`         | second fbdev demo (preemption/showcase)            |
 
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md) — the reference for
-implementing clients in other languages (e.g. the planned C library).
+implementing clients in other languages (e.g. kmscube's C lease client).
 
 Design documents:
 
@@ -23,6 +26,20 @@ Design documents:
   (fbdev/drm/input), registries, DRM lease state machine
 - [policy-engine.md](policy-engine.md) — windowing policy engine:
   preemption, waiter queues, policies
+
+## Backends are Cargo features
+
+The server is built with a chosen set of backends (see
+[resource-manager.md](resource-manager.md)):
+
+- `drm` — DRM cards as lease factories (**default**)
+- `input` — evdev devices (**default**)
+- `fbdev` — `/dev/fb0` (opt-in, legacy)
+
+```sh
+cargo build -p simple-graphics-controller                          # drm + input
+cargo build -p simple-graphics-controller --all-features           # + fbdev
+```
 
 ## Development environment
 
@@ -44,7 +61,7 @@ sudo apt install -y \
     libexpat1-dev:arm64
 ```
 
-The `:arm64` dev packages are needed by `sgc-fbdev-client`: `linfb` →
+The `:arm64` dev packages are needed by the fbdev demo clients: `linfb` →
 `font-loader` links against arm64 libfreetype/libfontconfig/libexpat. They are
 picked up via pkg-config, so the build must point at the arm64 pkg-config dir
 (see below). The `simple-graphics-controller` daemon itself has no C library
@@ -58,79 +75,59 @@ rustup target add aarch64-unknown-linux-gnu
 ```
 
 The repo's `.cargo/config.toml` already sets the linker
-(`aarch64-linux-gnu-gcc`) for the aarch64 target, and `zig` for the optional
-`x86_64-unknown-linux-musl` target (zig is only needed if you build that one).
+(`aarch64-linux-gnu-gcc`) for the aarch64 target.
 
 ## Build
 
-Two build modes. `dist-static` is the recommended one for deployment.
-
-### Static build (recommended — nothing needed on the board)
-
-Fully static binaries: static glibc (`crt-static`) + all font libraries linked
-statically via `pkg-config --static`. They run on any aarch64 Linux with no
-packages installed.
+Use the `just` recipes:
 
 ```sh
-just dist-static     # build + strip + copy into ./dist
+just build                 # host dynamic release build (workspace)
+just build-gnu-aarch64     # fully static aarch64 (gnu) build
+just dist-gnu-aarch64      # aarch64 build + strip + copy into ./dist
+just clean                 # remove ./target and ./dist
 ```
 
-Equivalent plain cargo:
+`just build-gnu-aarch64` produces fully static binaries (static glibc via
+`crt-static` + static font libs via pkg-config) that run on any aarch64
+Linux with no packages installed. It requires the static archive variants of
+the font libs on the build host (`libfreetype-dev:arm64`,
+`libfontconfig-dev:arm64`, `libexpat1-dev:arm64`, `libpng-dev:arm64`,
+`zlib1g-dev:arm64`, `libbrotli-dev:arm64`, `libbz2-dev:arm64`,
+`libc6-dev:arm64`).
+
+Equivalent plain cargo for the daemon alone (no font deps):
 
 ```sh
-PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_ALL_STATIC=1 \
-PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo build --release --target aarch64-unknown-linux-gnu --workspace
-```
-
-Requires the static archive variants of the font libs on the build host
-(`libfreetype-dev:arm64`, `libfontconfig-dev:arm64`, `libexpat1-dev:arm64`,
-`libpng-dev:arm64`, `zlib1g-dev:arm64`, `libbrotli-dev:arm64`,
-`libbz2-dev:arm64`, `libc6-dev:arm64`).
-
-### Dynamic build (fast iteration)
-
-Two env vars are required — without them `servo-fontconfig-sys` can't find the
-arm64 fontconfig and falls back to building it from source, which fails when
-cross-compiling:
-
-```sh
-export PKG_CONFIG_ALLOW_CROSS=1
-export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
-```
-
-```sh
-just build               # release build -> target/aarch64-unknown-linux-gnu/release
-just build BUILD=debug   # debug build
-just dist                # build + strip + copy into ./dist
-```
-
-### Plain cargo (dynamic)
-
-```sh
-PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
-    cargo build --release --target aarch64-unknown-linux-gnu --workspace
+cargo build --release -p simple-graphics-controller \
+    --target aarch64-unknown-linux-gnu
 ```
 
 ### Output
 
 ```
 target/aarch64-unknown-linux-gnu/release/simple-graphics-controller   # daemon
-target/aarch64-unknown-linux-gnu/release/sgc-fbdev-client             # demo client
+target/aarch64-unknown-linux-gnu/release/sgc-drm-client               # DRM demo
+target/aarch64-unknown-linux-gnu/release/sgc-fbdev-client             # fbdev demo
+dist/                                                                 # stripped copies
 ```
 
 ## Runtime dependencies on the target board
 
-- **Static build**: none. The binaries are self-contained.
-- **Dynamic build**: `sgc-fbdev-client` links `libfontconfig.so.1`, so the
-  board needs `libfontconfig1 libfreetype6 libexpat1`. The daemon only needs
-  the base glibc.
+- **Server (static build)**: none. The binaries are self-contained.
+- **Demo clients (static build)**: none; the dynamically-linked fbdev
+  clients need `libfontconfig.so.1` etc. (see the dist `file` output).
+- **DRM lease clients** (e.g. kmscube built with `-L`): need
+  libdrm/gbm/EGL/GLES on the board; they talk to `@sgc`, not the card.
 
 ## Usage
 
-1. Start the daemon on the board: `./simple-graphics-controller`
-2. Run the client: `./sgc-fbdev-client` (needs a working framebuffer device)
+1. Start the daemon on the board: `./simple-graphics-controller` (built with
+   `drm` + `input` by default).
+2. Run a client: `./sgc-drm-client` (acquires the first advertised DRM card),
+   `./sgc-fbdev-client` (needs a server built with `--all-features` and a
+   working framebuffer), or an external lease client like
+   `kmscube -L -A -N`.
 
 Logging is controlled by `RUST_LOG` (default: `info`):
 
@@ -147,3 +144,10 @@ SGC_POLICY=fair-queue ./simple-graphics-controller        # default: preempt + F
 SGC_POLICY=latest-owner ./simple-graphics-controller      # newest opener wins (LIFO)
 SGC_POLICY=first-owner ./simple-graphics-controller       # first holder keeps it; others denied
 ```
+
+## Development board
+
+Test/deploy target: `root@10.21.50.53` (aarch64). Copy binaries with `scp`
+(to `~` for tests), run the server, then exercise grant/revoke/release with
+the demo clients or kmscube `-L`. DRM cards are registered in priority order
+(connected first); not every card can lease (see resource-manager.md).
