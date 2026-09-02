@@ -17,6 +17,13 @@ library plus a framebuffer demo client draw via `linfb`.
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md) — the reference for
 implementing clients in other languages (e.g. the planned C library).
 
+Design documents:
+
+- [resource-manager.md](resource-manager.md) — backend features
+  (fbdev/drm/input), registries, DRM lease state machine
+- [policy-engine.md](policy-engine.md) — windowing policy engine:
+  preemption, waiter queues, policies
+
 ## Development environment
 
 Builds target **aarch64-unknown-linux-gnu** (64-bit ARM Linux, e.g. the H618
