@@ -6,6 +6,15 @@
 //! objects (see [`DrmDevice::grant_lease`]) and revocation is
 //! kernel-enforced. Registration order IS the advertised priority order
 //! (first is best): the card selection logic lives here with the open.
+//!
+//! A card's life is a type-state machine — [`DrmDeviceState::Locked`]
+//! (master held, leaseable) or [`DrmDeviceState::Leased`] (master + one
+//! live lease). Transitions consume the state and return `Result<Next,
+//! Self>`: an ioctl failure hands back the state you were in, so a card can
+//! never be lost or double-leased — the failure path is a retry, not a
+//! leak. The state lives behind `Mutex<Option<...>>` because the engine can
+//! push a Revoke for one task while another task runs a grant on the same
+//! card (see docs/resource-manager.md).
 
 use std::{
     fs::{File, read_dir},
@@ -21,7 +30,7 @@ use std::{
 use dashmap::DashMap;
 use drm::Device;
 use drm::control::{
-    Device as ControlDevice, LeaseId, RawResourceHandle, ResourceHandles, connector, crtc, plane,
+    Device as ControlDevice, LeaseId, RawResourceHandle, ResourceHandles, connector,
 };
 use nix::fcntl::OFlag;
 use simple_graphics_protocol::Resource;
@@ -65,13 +74,15 @@ impl DrmCard {
     }
 }
 
-/// One opened card, probed and ready to be registered.
+/// One opened card, probed and ready to be registered. Probe data is used
+/// for discovery/ordering only; the lease itself re-queries the card's
+/// objects fresh at `create_lease` time.
 struct OpenedCard {
     index: u8,
     card: DrmCard,
-    crtcs: Vec<crtc::Handle>,
+    /// Display connectors (writeback excluded) — a card with none is not
+    /// display-capable and is not registered.
     connectors: Vec<connector::Handle>,
-    planes: Vec<plane::Handle>,
     any_connected: bool,
 }
 
@@ -79,24 +90,103 @@ struct OpenedCard {
 /// each device creates leases on demand; clients never see it.
 pub type DrmRegistry = Arc<DashMap<Resource, DrmDevice>>;
 
+/// A live kernel lease: the id for `revoke_lease`, and the fd that keeps
+/// the lease alive while the server holds it (grants hand the client a dup
+/// of this fd — the server's copy is what makes revoke deterministic).
+#[derive(Debug)]
+pub struct DrmLease {
+    id: LeaseId,
+    fd: OwnedFd,
+}
+
+/// Master held, leaseable.
+#[derive(Debug)]
+pub struct LockedDrmDevice {
+    card: DrmCard,
+}
+
+/// Master held + one live lease.
+#[derive(Debug)]
+pub struct LeasedDrmDevice {
+    card: DrmCard,
+    lease: DrmLease,
+}
+
+impl LockedDrmDevice {
+    /// Query the card's objects fresh and lease them all. Returns `Err` with
+    /// the still-`Locked` device when probing or `create_lease` fails, so
+    /// the caller can restore the state unchanged.
+    pub fn create_lease(self) -> Result<LeasedDrmDevice, (Self, io::Error)> {
+        let card = self.card;
+
+        let objects: Vec<RawResourceHandle> = match lease_objects(&card) {
+            Ok(objects) => objects,
+            Err(e) => return Err((Self { card }, e)),
+        };
+
+        match card.create_lease(&objects, 0) {
+            Ok((id, fd)) => {
+                info!("Created lease {id} ({} objects)", objects.len());
+                Ok(LeasedDrmDevice {
+                    card,
+                    lease: DrmLease { id, fd },
+                })
+            }
+            Err(e) => Err((Self { card }, e)),
+        }
+    }
+}
+
+impl LeasedDrmDevice {
+    /// Kernel-revoke the lease. On success the lease is dead (even if the
+    /// client keeps its fd open) and we drop our fd copy, returning to
+    /// `Locked`. On failure return `Err(Self)` — id and fd are preserved,
+    /// so the reclaim can be retried later; never lose the lease on an
+    /// ioctl error.
+    pub fn revoke_lease(self) -> Result<LockedDrmDevice, (Self, io::Error)> {
+        let card = self.card;
+        let lease = self.lease;
+
+        match card.revoke_lease(lease.id) {
+            Ok(()) => {
+                drop(lease.fd);
+                Ok(LockedDrmDevice { card })
+            }
+            Err(e) => Err((
+                LeasedDrmDevice {
+                    card,
+                    lease: DrmLease {
+                        id: lease.id,
+                        fd: lease.fd,
+                    },
+                },
+                e,
+            )),
+        }
+    }
+}
+
+/// The state machine: a card is either leaseable or carrying one live
+/// lease. `DrmDevice` wraps it in a `Mutex<Option<_>>` (invariant: `Some`
+/// outside a transition) so cross-task revokes and grants serialize on the
+/// take/replace idiom.
+#[derive(Debug)]
+enum DrmDeviceState {
+    Locked(LockedDrmDevice),
+    Leased(LeasedDrmDevice),
+}
+
 /// A display-capable card the server owns as DRM master.
 ///
 /// Clients never get the master fd. Each grant creates a fresh lease over
-/// the card's objects and hands the client the lease fd; the lease is
-/// revoked (kernel-enforced) when the resource is released or revoked, so
-/// the server can reclaim the card at any time regardless of client
+/// the card's objects and hands the client a dup of the lease fd; the lease
+/// is revoked (kernel-enforced) when the resource is released or revoked,
+/// so the server can reclaim the card at any time regardless of client
 /// cooperation.
 #[derive(Debug)]
 pub struct DrmDevice {
     index: u8,
-    card: DrmCard,
-    crtcs: Vec<crtc::Handle>,
-    connectors: Vec<connector::Handle>,
-    planes: Vec<plane::Handle>,
-    /// The lease currently granted on this card, if any. At most one client
-    /// owns the resource at a time (the policy engine guarantees it), so a
-    /// single slot per card is enough.
-    active_lease: Mutex<Option<LeaseId>>,
+    state: Mutex<Option<DrmDeviceState>>,
 }
 
 impl DrmDevice {
@@ -104,50 +194,94 @@ impl DrmDevice {
     /// lease is revoked first (a previous owner may have died without
     /// releasing): the kernel cannot lease the same objects twice.
     pub fn grant_lease(&self) -> io::Result<OwnedFd> {
-        let mut active = self.active_lease.lock().unwrap();
-        if let Some(prev) = active.take() {
-            match self.card.revoke_lease(prev) {
-                Ok(()) => debug!("Revoked stale lease {prev} on card{}", self.index),
-                Err(e) => debug!("Stale lease {prev} on card{} already gone: {e}", self.index),
+        let mut guard = self.state.lock().unwrap();
+        let current = guard.take().expect("state always present");
+
+        // Ensure the card is Locked: revoke any live lease first.
+        let locked = match current {
+            DrmDeviceState::Locked(dev) => dev,
+            DrmDeviceState::Leased(dev) => match dev.revoke_lease() {
+                Ok(dev) => {
+                    debug!("Revoked stale lease on card{}", self.index);
+                    dev
+                }
+                Err((dev, e)) => {
+                    error!("Failed to revoke stale lease on card{}: {e}", self.index);
+                    *guard = Some(DrmDeviceState::Leased(dev));
+                    return Err(e);
+                }
+            },
+        };
+
+        match locked.create_lease() {
+            Ok(leased) => {
+                // Hand the client a dup; the server keeps its own copy in
+                // the Leased state (see DrmLease).
+                let fd = leased.lease.fd.try_clone();
+                match fd {
+                    Ok(fd) => {
+                        *guard = Some(DrmDeviceState::Leased(leased));
+                        Ok(fd)
+                    }
+                    Err(e) => {
+                        error!("Failed to dup lease fd on card{}: {e}", self.index);
+                        // Lease is alive but unsendable; put it back Leased
+                        // so a later grant revokes and retries it.
+                        *guard = Some(DrmDeviceState::Leased(leased));
+                        Err(e)
+                    }
+                }
+            }
+            Err((dev, e)) => {
+                *guard = Some(DrmDeviceState::Locked(dev));
+                Err(e)
             }
         }
-
-        let objects: Vec<RawResourceHandle> = self
-            .crtcs
-            .iter()
-            .copied()
-            .map(RawResourceHandle::from)
-            .chain(self.connectors.iter().copied().map(RawResourceHandle::from))
-            .chain(self.planes.iter().copied().map(RawResourceHandle::from))
-            .collect();
-
-        let (lease_id, fd) = self.card.create_lease(&objects, 0)?;
-        info!(
-            "Created lease {lease_id} on card{} ({} objects: {} crtcs, {} connectors, {} planes)",
-            self.index,
-            objects.len(),
-            self.crtcs.len(),
-            self.connectors.len(),
-            self.planes.len()
-        );
-        *active = Some(lease_id);
-        Ok(fd)
     }
 
     /// Revoke the granted lease right now, without waiting for the client
-    /// to close its fd. A no-op when no lease is active.
+    /// to close its fd. A no-op when Locked; a failed revoke keeps the
+    /// `Leased` state (id + fd preserved) so the next reclaim can retry.
     pub fn revoke_lease(&self) {
-        let mut active = self.active_lease.lock().unwrap();
-        if let Some(lease_id) = active.take() {
-            match self.card.revoke_lease(lease_id) {
-                Ok(()) => info!("Revoked lease {lease_id} on card{}", self.index),
-                Err(e) => error!(
-                    "Failed to revoke lease {lease_id} on card{}: {e}",
-                    self.index
-                ),
-            }
-        }
+        let mut guard = self.state.lock().unwrap();
+        let current = guard.take().expect("state always present");
+
+        *guard = Some(match current {
+            DrmDeviceState::Leased(dev) => match dev.revoke_lease() {
+                Ok(dev) => {
+                    info!("Revoked lease on card{}", self.index);
+                    DrmDeviceState::Locked(dev)
+                }
+                Err((dev, e)) => {
+                    error!("Failed to revoke lease on card{}: {e}", self.index);
+                    DrmDeviceState::Leased(dev)
+                }
+            },
+            state => state,
+        });
     }
+}
+
+/// The card's leaseable objects as `RawResourceHandle`s, queried fresh:
+/// every CRTC and plane, and every display connector (writeback connectors
+/// are capture-only and cannot present a display). A connector whose probe
+/// failed is kept rather than silently dropped.
+fn lease_objects(card: &DrmCard) -> io::Result<Vec<RawResourceHandle>> {
+    let handles = card.resource_handles()?;
+    let planes = card.plane_handles()?;
+
+    let connectors = display_connectors(card, &handles);
+
+    let mut objects: Vec<RawResourceHandle> = handles
+        .crtcs
+        .iter()
+        .copied()
+        .map(RawResourceHandle::from)
+        .chain(connectors.iter().copied().map(RawResourceHandle::from))
+        .chain(planes.iter().copied().map(RawResourceHandle::from))
+        .collect();
+    objects.shrink_to_fit();
+    Ok(objects)
 }
 
 /// Open every DRM card that can present a display and register it as
@@ -205,13 +339,6 @@ pub(super) fn open_devices(drm_reg: DrmRegistry, advertised: &mut Vec<Resource>)
                 continue;
             }
         };
-        let planes = match card.plane_handles() {
-            Ok(planes) => planes,
-            Err(e) => {
-                error!("Failed to query planes on {}: {e}", path.display());
-                continue;
-            }
-        };
 
         let connectors = display_connectors(&card, &handles);
         let any_connected = connectors.iter().any(|handle| {
@@ -222,9 +349,7 @@ pub(super) fn open_devices(drm_reg: DrmRegistry, advertised: &mut Vec<Resource>)
         opened.push(OpenedCard {
             index,
             card,
-            crtcs: handles.crtcs,
             connectors,
-            planes,
             any_connected,
         });
     }
@@ -252,11 +377,9 @@ pub(super) fn open_devices(drm_reg: DrmRegistry, advertised: &mut Vec<Resource>)
             resource.clone(),
             DrmDevice {
                 index: opened.index,
-                card: opened.card,
-                crtcs: opened.crtcs,
-                connectors: opened.connectors,
-                planes: opened.planes,
-                active_lease: Mutex::new(None),
+                state: Mutex::new(Some(DrmDeviceState::Locked(LockedDrmDevice {
+                    card: opened.card,
+                }))),
             },
         );
         advertised.push(resource);
