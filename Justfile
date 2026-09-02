@@ -10,7 +10,7 @@
 #   just clean               remove ./target and ./dist
 
 # All shipped binaries; the dist recipes copy/strip/file exactly these.
-BINS := "simple-graphics-controller sgc-fbdev-client sgc-fbdev-client-2"
+BINS := "simple-graphics-controller sgc-fbdev-client sgc-fbdev-client-2 sgc-drm-client"
 
 TARGET_GNU_AARCH64 := "aarch64-unknown-linux-gnu"
 TARGET_MUSL_AMD64 := "x86_64-unknown-linux-musl"

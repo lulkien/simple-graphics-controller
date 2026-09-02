@@ -10,19 +10,14 @@ use serde::{Deserialize, Serialize};
 /// A resource that can be managed by the server, grouped by kind.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Resource {
-    /// A display/output device.
-    Display(DisplayResource),
+    /// The framebuffer device (`/dev/fb0`).
+    Fbdev,
+    /// A DRM display card (`/dev/dri/cardN`). The granted fd is a lease:
+    /// the holder can modeset on the card's objects but never becomes
+    /// DRM master, and the server can revoke it at any time.
+    Drm { card: u8 },
     /// An input device.
     Input(InputResource),
-}
-
-/// Display resources.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum DisplayResource {
-    /// The framebuffer device (/dev/fb0).
-    Fbdev,
-    /// A DRM render/display card (/dev/dri/cardN).
-    Drm { card: u8 },
 }
 
 /// Input resources. The index counts devices of the same class, so the

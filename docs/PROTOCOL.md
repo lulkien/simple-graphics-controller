@@ -2,18 +2,18 @@
 
 Wire protocol between `simple-graphics-controller` (server) and its clients.
 This document is the reference for implementing clients in other languages
-(e.g. the planned C library for LVGL integration).
+(e.g. the C client in kmscube's `drm-lease-client.c`).
 
 - Transport: Unix stream socket, **abstract namespace** address `@sgc`
   (`sun_path[0] = '\0'`, then `"sgc"`; addrlen = `offsetof(sockaddr_un, sun_path) + 1 + 3`).
 - Encoding: MessagePack, as produced by `rmp_serde` with `write_named` —
-  i.e. enums are string-tagged maps, fields are named maps, resources are
-  nested string-tagged maps. Self-describing; no integer variant tags.
+  enums are one-entry maps `{variant: payload}`, payloads are named-field
+  maps, and **unit variants are bare strings** (`"Ack"`, `"Fbdev"`). The
+  encoding is self-describing; there are no integer variant tags.
 - Framing: **length-prefixed**. Every message is prefixed with a 4-byte
   big-endian unsigned length header giving the size of the MessagePack payload
   (max 1 MiB). Readers read 4 bytes, then exactly N bytes. This removes the
-  need to guess message boundaries on a stream socket. (Before framing, each
-  message was a bare MessagePack value.)
+  need to guess message boundaries on a stream socket.
 - File descriptors: passed out-of-band with `SCM_RIGHTS`. A `Grant` carries
   **exactly one fd** — for its single granted resource. Only `Grant` carries
   fds.
@@ -74,12 +74,15 @@ with no preceding `Acquire`: it means the client was re-granted after being
 preempted. Clients must keep reading after `Release`.
 
 Preemption handoff: the server sends `Revoke {resource}` to the current
-owner; the owner stops using the resource and replies `Release` — that
-`Release` doubles as the revoke acknowledgment, and the server then grants
-the resource to the next waiter (the preempted owner is requeued and gets
-one more turn). If the owner neither releases nor disconnects within
-**5 seconds**, the server force-reclaims the resource and grants the next
-waiter anyway.
+owner as an ASK — the owner keeps a valid fd (and for DRM a valid lease)
+through the grace window (`REVOKE_TIMEOUT`, 5s) so it can finish its frame.
+The owner stops using the resource and replies `Release` — that `Release`
+doubles as the revoke acknowledgment, and the server then grants the
+resource to the next waiter (the preempted owner is requeued and gets one
+more turn). If the owner neither releases nor disconnects within 5 seconds,
+the server force-reclaims the resource and grants the next waiter anyway;
+for DRM that force is kernel-enforced (the lease is revoked even though the
+client keeps its fd open), for fbdev/input it is cooperative.
 
 After sending `Grant`, the server waits up to **5 seconds** for the client to
 reply with `Ack` (sent only after the client successfully received the grant
@@ -90,38 +93,63 @@ grant is unconfirmed. The resource stays owned by the client either way;
 ## Messages
 
 Enums serialize as a one-entry map `{variant: payload}`; struct payloads are
-one-entry maps `{field: value}`.
+one-entry maps `{field: value}`; unit variants are bare strings.
 
 ### Resource
 
-Two-level enum: a resource is either a **display** or an **input** device.
-The server registers one resource per discovered device.
+`Resource` is a flat enum with one variant per resource kind. The server
+registers one resource per discovered device.
 
-| kind    | value                | wire (decoded)                  |
-| ------- | -------------------- | ------------------------------- |
-| Display | `Fbdev`              | `{"Display": "Fbdev"}`          |
-| Display | `Drm { card: u8 }`   | `{"Display": {"Drm": 0}}`       |
-| Input   | `Mouse(u8)`          | `{"Input": {"Mouse": 0}}`       |
-| Input   | `Keyboard(u8)`       | `{"Input": {"Keyboard": 0}}`    |
-| Input   | `Touch(u8)`          | `{"Input": {"Touch": 0}}`       |
+| variant               | fields        | wire (decoded)             |
+| --------------------- | ------------- | -------------------------- |
+| `Fbdev`               | —             | `"Fbdev"`                  |
+| `Drm`                 | `card: u8`    | `{"Drm": {"card": 0}}`     |
+| `Input(InputResource)`| —             | `{"Input": {"Mouse": 0}}`  |
 
-The index counts devices of the same class (`Mouse(0)`, `Mouse(1)`, ...) so
-the registry can hold several at once. Input devices come from
-`/dev/input/event*`, classified by capabilities (touch > mouse > keyboard).
+`InputResource` is `Mouse(u8) | Keyboard(u8) | Touch(u8)` — the index counts
+devices of the same class so the registry can hold several at once. Input
+devices come from `/dev/input/event*`, classified by capabilities (touch >
+mouse > keyboard).
 
-`{"Display": "Fbdev"}` wire hex:
-`81 a7 44 69 73 70 6c 61 79 a5 46 62 64 65 76`.
+**Fbdev**: `/dev/fb0`, registered only when the server is built with the
+`fbdev` feature (off by default).
+
+**DRM**: every `/dev/dri/cardN` that can present a display — has display
+connectors (writeback connectors are capture-only and don't count) — becomes
+one `{"Drm": {"card": N}}`, registered only when built with the `drm`
+feature (default). Render nodes (`renderDNN`) are never registered.
+`Advertise` lists the cards in priority order: a card with a connected
+connector first, then the lowest index — so the first `Drm` entry is the best
+display card. A client that wants "a screen" takes the first `Drm` in the
+list; one that wants a specific card names it. The granted fd is a DRM
+lease, never the master fd.
+
+Resource wire encodings (raw payload bytes):
+
+| resource                      | wire hex                                      |
+| ----------------------------- | --------------------------------------------- |
+| `Fbdev`                       | `a5 46 62 64 65 76`                           |
+| `Drm { card: 0 }`             | `81 a3 44 72 6d 81 a4 63 61 72 64 00`         |
+| `Input(Mouse(1))`             | `81 a5 49 6e 70 75 74 81 a5 4d 6f 75 73 65 01` |
 
 ### ClientRequest (client → server)
 
-| variant  | fields                 | example wire (hex) |
-| -------- | ---------------------- | ------------------ |
-| Acquire  | `resource: Resource`   | `81 a7 41 63 71 75 69 72 65 81 a8 72 65 73 6f 75 72 63 65 81 a7 44 69 73 70 6c 61 79 a5 46 62 64 65 76` |
-| Release  | `resource: Resource`   | `81 a7 52 65 6c 65 61 73 65 81 a8 72 65 73 6f 75 72 63 65 81 a7 44 69 73 70 6c 61 79 a5 46 62 64 65 76` |
-| Ack      | —                      | `a3 41 63 6b`      |
+| variant  | fields                 | wire (decoded) |
+| -------- | ---------------------- | -------------- |
+| Acquire  | `resource: Resource`   | `{"Acquire": {"resource": ...}}` |
+| Release  | `resource: Resource`   | `{"Release": {"resource": ...}}` |
+| Ack      | —                      | `"Ack"`        |
 
-`Acquire {resource: Display(Fbdev)}` decoded:
-`{"Acquire": {"resource": {"Display": "Fbdev"}}}`.
+Raw payload bytes:
+
+| request                     | wire hex                                      |
+| --------------------------- | --------------------------------------------- |
+| `Acquire {resource: Fbdev}` | `81 a7 41 63 71 75 69 72 65 81 a8 72 65 73 6f 75 72 63 65 a5 46 62 64 65 76` |
+| `Acquire {resource: Drm{0}}`| `81 a7 41 63 71 75 69 72 65 81 a8 72 65 73 6f 75 72 63 65 81 a3 44 72 6d 81 a4 63 61 72 64 00` |
+| `Release {resource: Drm{0}}`| `81 a7 52 65 6c 65 61 73 65 81 a8 72 65 73 6f 75 72 63 65 81 a3 44 72 6d 81 a4 63 61 72 64 00` |
+| `Ack`                       | `a3 41 63 6b`              |
+
+`Acquire {resource: Drm{0}}` decoded: `{"Acquire": {"resource": {"Drm": {"card": 0}}}}`.
 
 ### ServerMessage (server → client)
 
@@ -132,12 +160,16 @@ the registry can hold several at once. Input devices come from
 | Deny       | `reason: String`                | no |
 | Revoke     | `resource: Resource`            | no |
 
-Example `Grant {resource: Display(Fbdev)}`:
-`81 a5 47 72 61 6e 74 81 a8 72 65 73 6f 75 72 63 65 81 a7 44 69 73 70 6c 61 79 a5 46 62 64 65 76`
-decoded: `{"Grant": {"resource": {"Display": "Fbdev"}}}`.
+Raw payload bytes:
 
-Example `Deny {reason: "owned"}`:
-`81 a4 44 65 6e 79 81 a6 72 65 61 73 6f 6e a5 6f 77 6e 65 64`.
+| message                             | wire hex |
+| ----------------------------------- | -------- |
+| `Advertise {available_resources: [Drm{0}, Fbdev, Input(Mouse(0))]}` | `81 a9 41 64 76 65 72 74 69 73 65 81 b3 61 76 61 69 6c 61 62 6c 65 5f 72 65 73 6f 75 72 63 65 73 93 81 a3 44 72 6d 81 a4 63 61 72 64 00 a5 46 62 64 65 76 81 a5 49 6e 70 75 74 81 a5 4d 6f 75 73 65 00` |
+| `Grant {resource: Drm{0}}`          | `81 a5 47 72 61 6e 74 81 a8 72 65 73 6f 75 72 63 65 81 a3 44 72 6d 81 a4 63 61 72 64 00` |
+| `Revoke {resource: Drm{0}}`         | `81 a6 52 65 76 6f 6b 65 81 a8 72 65 73 6f 75 72 63 65 81 a3 44 72 6d 81 a4 63 61 72 64 00` |
+| `Deny {reason: "owned"}`            | `81 a4 44 65 6e 79 81 a6 72 65 61 73 6f 6e a5 6f 77 6e 65 64` |
+
+`Grant {resource: Drm{0}}` decoded: `{"Grant": {"resource": {"Drm": {"card": 0}}}}`.
 
 ## Notes for a C implementation
 
@@ -153,9 +185,22 @@ Example `Deny {reason: "owned"}`:
   discard it. `CMSG_SPACE(sizeof(int))` is enough. Only `Grant` messages
   carry an fd, and it is exactly one, for the granted resource. Ownership
   transfers to the client — close the fd when done or on `Release`.
-- **Strings**: "Display", "Input", "Fbdev", variant names, field names are
-  fixed for now, but parse them as arbitrary-length MessagePack strings
-  (fixstr/str8/str16/str32) to stay compatible. Same for arrays/maps
-  (fix/16/32 forms).
+- **Strings**: variant names ("Advertise", "Acquire", "Grant", "Deny",
+  "Revoke", "Release", "Ack"), field names ("available_resources",
+  "resource", "reason", "card"), resource kinds ("Fbdev", "Drm", "Input",
+  "Mouse", "Keyboard", "Touch") are fixed for now, but parse them as
+  arbitrary-length MessagePack strings (fixstr/str8/str16/str32) to stay
+  compatible. Same for arrays/maps (fix/16/32 forms). Card indexes and the
+  input class indexes are small non-negative integers (positive fixint, or
+  uint8/16 for large values).
+- **Unit vs map variants**: a resource that carries no data is a bare
+  string (`"Fbdev"`); one with data is `{"Kind": {"field": value}}` (`{"Drm":
+  {"card": 0}}`, `{"Input": {"Mouse": 0}}`). Clients that only want a Drm
+  card must skip entries of other shapes when scanning the advertise list.
+- **Revoke while drawing**: `Revoke` can arrive at any time, not just as a
+  reply. A client that renders in a loop must watch the control socket
+  concurrently (e.g. a reader thread) and answer `Release` within the grace
+  window; otherwise the server force-reclaims after 5s and the client's next
+  modeset ioctl fails on the invalidated fd.
 - **Verification tool**: `cargo run -p simple-graphics-protocol --example
   wire_dump` prints the exact bytes for every message.

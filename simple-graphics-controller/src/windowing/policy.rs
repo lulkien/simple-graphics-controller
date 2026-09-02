@@ -2,10 +2,7 @@
 //! does — grant / preempt-and-queue / queue / deny — and how waiters are
 //! served when the resource frees. No mechanism here; the engine enforces.
 
-use std::{
-    collections::VecDeque,
-    str::FromStr,
-};
+use std::{collections::VecDeque, str::FromStr};
 
 pub enum SlotState {
     /// No owner; next Acquire is granted immediately.

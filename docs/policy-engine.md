@@ -346,6 +346,14 @@ screen; no app can starve another by repeatedly opening.
 - Under preemptive policies an `Acquire` never fails for "owned" — the
   client blocks until `Grant` or `Deny`. Cancelling = disconnect (dequeues).
   A `CancelAcquire` message is the natural future extension.
+- **DRM: the wire `Revoke` is an ask, not a kill.** The kernel
+  `revoke_lease()` ioctl runs at the HANDOFF, not when the `Revoke` message
+  is written: the evicted client keeps a fully valid lease through the grace
+  window (REVOKE_TIMEOUT) so it can finish its frame. The lease is revoked
+  on the client's `Release` — or, if it stays silent, by the next grant's
+  stale-revoke after force-reclaim. Revoking first would kill the client's
+  next modeset ioctl mid-frame on an invalid lease fd. Fbdev/input have no
+  kernel revoke at all — cooperative only.
 
 ## Future: exclusion groups (fbdev vs drm)
 
@@ -365,6 +373,8 @@ arbitration unit becomes a GROUP, not a resource:
 - A multi-resource Acquire spanning one group is invalid (mutually
   exclusive) -> denied, no deadlock case to design for.
 
-NOT implemented yet: only Fbdev is exposed, and per-resource slots are
-exactly correct until then. The trigger is the commit that exposes
-`Resource::Drm`.
+NOT implemented yet: with `Resource::Drm` exposed, per-resource slots no
+longer express that Fbdev and Drm are two access paths to the SAME panel — a
+Drm grant while Fbdev is held, or vice versa, must be arbitrated as one
+group, not two independent slots. The group is the next step after the
+per-backend resource work (see resource-manager.md).

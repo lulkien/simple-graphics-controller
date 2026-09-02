@@ -5,13 +5,12 @@
 
 use std::io::ErrorKind;
 
-use crate::error::ServerResult;
-use crate::types::{ClientId, ResourceRegistry};
-use crate::windowing::PolicyEngine;
-use nix::libc::pid_t;
-use simple_graphics_protocol::{
-    ClientRequest, FRAME_HEADER_LEN, deserialize, parse_frame_header,
+use crate::{
+    error::ServerResult, resource_manager::ResourceRegistries, types::ClientId,
+    windowing::PolicyEngine,
 };
+use nix::libc::pid_t;
+use simple_graphics_protocol::{ClientRequest, FRAME_HEADER_LEN, deserialize, parse_frame_header};
 use tokio::{net::UnixStream, time::Instant};
 use tracing::{debug, trace};
 
@@ -26,7 +25,7 @@ pub(super) async fn process_wire_bytes(
     client_id: ClientId,
     client_pid: pid_t,
     engine: &PolicyEngine,
-    resource_reg: &ResourceRegistry,
+    registries: &ResourceRegistries,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<bool> {
     // Drain whatever is available right now (WouldBlock = back to select!).
@@ -66,7 +65,7 @@ pub(super) async fn process_wire_bytes(
             client_id,
             client_pid,
             engine,
-            resource_reg,
+            registries,
             ack_deadline,
         )
         .await?;

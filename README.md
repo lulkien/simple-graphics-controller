@@ -9,3 +9,5 @@ All documentation lives in [docs/](docs/):
 - [PROTOCOL](docs/PROTOCOL.md) — wire protocol specification
 - [policy-engine](docs/policy-engine.md) — windowing policy engine:
   preemption, waiter queues, policies
+- [resource-manager](docs/resource-manager.md) — backend features
+  (fbdev/drm/input), registries, DRM lease state machine

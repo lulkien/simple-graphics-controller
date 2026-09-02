@@ -1,93 +1,82 @@
 //! Open and register every available resource (video + input). Ownership is
 //! NOT tracked here anymore — that is the policy engine's job.
 //!
-//! Input device discovery (enumeration + classification) lives in the
-//! [`input`] submodule; this file only opens what it finds.
+//! Backends are compile-time features (see docs/resource-manager.md):
+//! `fbdev`, `drm`, and `input` each live in their own module behind a
+//! `#[cfg(feature = ...)]`. Default features: `drm` + `input` — an unbuilt
+//! backend is never opened, registered, or advertised; the engine denies
+//! Acquires against it with "not registered". The protocol crate is
+//! deliberately ungated (the wire format must not depend on the build).
+//!
+//! [`query_resource`] returns the advertised list in priority order:
+//! clients read it top-down, so the first entry of a kind is the best
+//! match (the first DRM card is the display card).
 
+#[cfg(feature = "drm")]
+mod drm;
+#[cfg(feature = "fbdev")]
+mod fbdev;
+#[cfg(feature = "input")]
 mod input;
 
-use std::{
-    fs::{File, read_dir},
-    os::fd::AsRawFd,
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use simple_graphics_protocol::{DisplayResource, Resource};
-use tracing::{debug, error, info};
+use simple_graphics_protocol::Resource;
 
 use crate::types::ResourceRegistry;
 
+#[cfg(feature = "drm")]
+pub use drm::DrmRegistry;
+
+/// The server's grant sources, cloned per client connection.
+#[derive(Clone)]
+pub struct ResourceRegistries {
+    /// Static fds for `Fbdev` and `Input` (grants are dups of these).
+    pub fds: ResourceRegistry,
+    /// DRM lease factories: each grant creates a fresh lease fd.
+    #[cfg(feature = "drm")]
+    pub drm: DrmRegistry,
+}
+
+/// Everything the server opened at startup.
+pub struct OpenedResources {
+    /// The registries the server grants from.
+    pub registries: ResourceRegistries,
+    /// Resources in advertised order (priority order — first is best).
+    pub advertised: Vec<Resource>,
+}
+
 /// Open and register every available resource.
-pub fn query_resource() -> ResourceRegistry {
+///
+/// Returns the registries plus the resources in advertised order (priority
+/// order — first is best). Backends that are not compiled in contribute
+/// nothing.
+pub fn query_resource() -> OpenedResources {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
+    // With no backend features the list is never pushed to; the mut keeps
+    // the body identical across all feature combinations.
+    #[allow(unused_mut)]
+    let mut advertised = Vec::new();
 
-    open_fbdev(resource_reg.clone());
-    open_input_devices(resource_reg.clone());
-    open_drm_devices(resource_reg.clone());
+    #[cfg(feature = "fbdev")]
+    fbdev::open(resource_reg.clone(), &mut advertised);
 
-    resource_reg
-}
+    #[cfg(feature = "drm")]
+    let drm_registry: DrmRegistry = Arc::new(DashMap::new());
 
-fn open_fbdev(resource_reg: ResourceRegistry) {
-    match File::options().read(true).write(true).open("/dev/fb0") {
-        Ok(file) => {
-            let fd = file.as_raw_fd();
-            resource_reg.insert(Resource::Display(DisplayResource::Fbdev), file.into());
-            info!("Opened /dev/fb0");
-            debug!("Registered resource Fbdev (fd {fd})");
-        }
-        Err(e) => {
-            error!("Failed to open /dev/fb0: {e}");
-        }
+    #[cfg(feature = "drm")]
+    drm::open_devices(drm_registry.clone(), &mut advertised);
+
+    #[cfg(feature = "input")]
+    input::open_devices(resource_reg.clone(), &mut advertised);
+
+    OpenedResources {
+        registries: ResourceRegistries {
+            fds: resource_reg,
+            #[cfg(feature = "drm")]
+            drm: drm_registry,
+        },
+        advertised,
     }
-}
-
-/// Open and register every input device the discovery submodule found. Each
-/// registry fd is the server's own open; grants dup it (the client parses
-/// evdev events straight off the dup — no path needed).
-fn open_input_devices(resource_reg: ResourceRegistry) {
-    for device in input::discover() {
-        let file = match File::options().read(true).open(&device.path) {
-            Ok(file) => file,
-            Err(e) => {
-                error!("Failed to open {}: {e}", device.path.display());
-                continue;
-            }
-        };
-
-        let resource = Resource::Input(device.resource);
-        let fd = file.as_raw_fd();
-        resource_reg.insert(resource.clone(), file.into());
-        info!("Opened {} ({}): {resource:?} (fd {fd})", device.path.display(), device.name);
-    }
-}
-
-#[allow(unused)]
-fn open_drm_devices(resource_reg: ResourceRegistry) {
-    let entries = match read_dir("/dev/dri/") {
-        Ok(entries) => entries,
-        Err(e) => {
-            error!("Failed to read /dev/dri: {e}");
-            return;
-        }
-    };
-
-    let mut paths = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return false;
-            };
-
-            name.starts_with("card")
-        })
-        .collect::<Vec<_>>();
-
-    paths.sort();
-    debug!(
-        "DRM devices present: {:?} (not exposed as resources yet)",
-        paths
-    );
 }

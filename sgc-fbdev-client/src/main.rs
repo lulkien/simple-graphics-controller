@@ -19,7 +19,7 @@ mod timer;
 use std::{os::fd::OwnedFd, sync::mpsc, thread};
 
 use input::InputCmd;
-use libsgc_rs::{DisplayResource, InputResource, Resource, SgcClient, SgcError, SgcEvent};
+use libsgc_rs::{InputResource, Resource, SgcClient, SgcError, SgcEvent};
 use render::RenderCmd;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial grant.
     render_tx.send(RenderCmd::Draw {
-        resource: Resource::Display(DisplayResource::Fbdev),
+        resource: Resource::Fbdev,
         fd: fbdev_fd,
     })?;
 
@@ -121,14 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn acquire_display_fd(client: &mut SgcClient, available: &[Resource]) -> Result<OwnedFd, SgcError> {
     // Fail fast if the server does not offer Fbdev (e.g. no /dev/fb0 on
     // the host): an acquire would only be denied with a round trip.
-    if !available.contains(&Resource::Display(DisplayResource::Fbdev)) {
+    if !available.contains(&Resource::Fbdev) {
         eprintln!("server does not offer Fbdev; available: {available:?}");
         return Err(SgcError::NotAvailable {
-            resource: Resource::Display(DisplayResource::Fbdev),
+            resource: Resource::Fbdev,
         });
     }
 
-    match client.acquire(Resource::Display(DisplayResource::Fbdev)) {
+    match client.acquire(Resource::Fbdev) {
         Ok(()) => println!("granted Fbdev (client holds fd)"),
         Err(SgcError::Denied { reason }) => {
             eprintln!("denied: {reason}");
@@ -142,7 +142,7 @@ fn acquire_display_fd(client: &mut SgcClient, available: &[Resource]) -> Result<
     println!("held: {:?}", client.held());
 
     // Borrow a dup for the render task; the client keeps the canonical.
-    match client.fd(&Resource::Display(DisplayResource::Fbdev)) {
+    match client.fd(&Resource::Fbdev) {
         Ok(fd) => Ok(fd),
         Err(e) => {
             eprintln!("lend failed: {e}");
