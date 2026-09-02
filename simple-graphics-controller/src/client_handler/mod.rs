@@ -82,6 +82,7 @@ pub async fn handle_connection(
                         &mut stream,
                         client_id,
                         client_pid,
+                        &engine,
                         msg,
                         &registries,
                         &mut ack_deadline,

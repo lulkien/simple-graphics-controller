@@ -14,7 +14,7 @@ use nix::libc::pid_t;
 use sendfd::SendWithFd;
 use simple_graphics_protocol::{ClientRequest, Resource, ServerMessage, serialize_framed};
 use tokio::{io::AsyncWriteExt, net::UnixStream, time::Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::GRANT_ACK_TIMEOUT;
 
@@ -69,7 +69,22 @@ pub(super) async fn handle_acquire(
 
     match engine.acquire(client_id, resource.clone()).await {
         AcquireOutcome::Granted => {
-            send_grant(stream, client_id, client_pid, resource, registries).await?;
+            // The engine marked this client the owner. Produce the fd and
+            // send the Grant; if the fd cannot be produced (e.g.
+            // create_lease failed on an un-leasable card), roll the
+            // ownership back so the next waiter can be served, reply Deny,
+            // and keep the connection alive.
+            if let Err(e) =
+                send_grant(stream, client_id, client_pid, resource.clone(), registries).await
+            {
+                warn!("[client {client_id} (pid {client_pid})] Grant failed for {resource:?}: {e}");
+                engine.release(client_id, resource.clone()).await;
+                let resp = serialize_framed(&ServerMessage::Deny {
+                    reason: format!("grant failed: {e}"),
+                })?;
+                stream.write_all(&resp).await.map_err(ServerError::Write)?;
+                return Ok(());
+            }
             *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
         }
         AcquireOutcome::Queued => {
