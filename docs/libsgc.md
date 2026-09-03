@@ -102,6 +102,31 @@ boundary.
 The callback convenience (`start_event_loop`) is a thin wrapper that calls
 `pump(None)` in a loop and dispatches `SgcEvent` to the app's `FnMut`.
 
+### Errors
+
+`SgcError` (thiserror) is the one error type crossing the crate boundary —
+apps match on it directly (no `anyhow` inside a public API):
+
+| site | variant |
+| ---- | ------- |
+| connect: no server / refused | `ConnectFailed(io)` |
+| connect: bad frame / non-`Advertise` first message | `Protocol` / `UnexpectedMessage` |
+| fail-fast: resource not offered | `NotAvailable { resource }` |
+| acquire: server deny | `Denied { reason }` |
+| acquire: grant without exactly 1 fd | `Io(InvalidData)` |
+| acquire/pump: wire failure | `Io` |
+| any: frame decode | `Protocol` |
+| `fd()` of a resource not held | `NotHeld { resource }` |
+
+EOF inside the event loop is normal teardown, not an app-facing error: pump
+drains the held resources as `Revoked` events and then returns the error.
+
+### Open items
+
+- Voluntary `release()` (hand a resource back without waiting for a revoke):
+  check `held`, write `Release`, drop the canonical. The server currently
+  reclaims on disconnect or preemption only.
+
 ## The C ABI
 
 `libsgc-c` is a shim crate: `#[repr(C)]` types + `#[unsafe(no_mangle)]`
@@ -207,6 +232,11 @@ same tested core.
   the full grant / ask-first revoke / requeue / re-grant / resume cycle
   against the real daemon — kmscube survives preemption and rebuilds its
   display stack on the re-granted lease fd.
+- The Rust demos also run on fbdev (sgc-fbdev-client). One linfb quirk
+  shaped that demo: `Framebuffer::open_with_fd` takes the fd and the
+  mmap outlives the fd (the mapping holds the file description), so the
+  renderer is built once and kept across revoke/regrant — a cycle just
+  redraws, no reopen.
 
 ## Source layout
 
