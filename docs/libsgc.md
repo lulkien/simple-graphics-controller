@@ -146,9 +146,10 @@ void sgc_release(sgc_client *c);                            /* drop + close, NUL
 Rules that keep the ABI honest:
 
 - Opaque handle, no struct layout exposed.
-- All fallible functions return `0` on success / `-1` (or `NULL`) with a
-  message in `err` (the C analog of `SgcError`); no panics cross the
-  boundary — `catch_unwind` at every entry point.
+- All fallible functions that take an `err` buffer return `0` on success /
+  `-1` (or `NULL`) with a message in it (the C analog of `SgcError`); no
+  panics cross the boundary — `catch_unwind` at every entry point.
+  `sgc_advertised` is the exception: it signals failure with `-1` only.
 - The grant fd and `sgc_fd()` dups transfer ownership to the caller; the
   header says so next to every fd-returning signature.
 - `sgc_pump` returns `1` = event stored in `*out`, `0` = nothing happened,
@@ -159,7 +160,9 @@ Rules that keep the ABI honest:
 - Enums are plain `int` constants, not C enums, so ABI size is stable.
 
 The header is handwritten (the surface is ~6 functions + 2 structs);
-cbindgen earns its keep only if the surface grows.
+cbindgen earns its keep only if the surface grows. The host build emits
+`libsgc.a` + `libsgc.so`; the aarch64 build is static-only (`crt-static`
+drops the cdylib) — board consumers link `libsgc.a`.
 
 ## The C++ face
 

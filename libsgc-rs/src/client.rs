@@ -159,8 +159,10 @@ impl SgcClient {
     ///
     /// Blocks up to `timeout` (`None` = wait until a frame or error
     /// arrives). [`SgcEvent`]s come back one per call, so loop-shaped
-    /// consumers drive this from their own main loop. `Ok(None)` means
-    /// nothing happened (bounded wait elapsed, or a signal) — re-pump.
+    /// consumers drive this from their own main loop. `Ok(None)` means no
+    /// event this call — the wait elapsed, a signal interrupted it, or an
+    /// anomalous frame was consumed and skipped (a grant without its fd,
+    /// an unexpected message; noted on stderr) — re-pump.
     ///
     /// The protocol work for an event is performed here, before the event
     /// is returned: the `Ack` after a grant, the `Release` revoke-ack
