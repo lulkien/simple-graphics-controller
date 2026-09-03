@@ -20,36 +20,28 @@ This document is the reference for implementing clients in other languages
 
 ## Message flow
 
-```
-client                          server
-  |          connect(@sgc)         |
-  |------------------------------->|
-  |                                |
-  |            Advertise           |   {available_resources}
-  |<-------------------------------|
-  |                                |
-  |         Acquire {resource}     |
-  |------------------------------->|
-  |                                |
-  |              Grant             |   {resource}  + fd (SCM_RIGHTS)
-  |<-------------------------------|
-  |                                |
-  |               Ack              |   (client confirms receipt of Grant+fd)
-  |------------------------------->|
-  |                                |
-  |            (or Deny {reason})   |
-  |                                |
-  |        Release {resource}      |
-  |------------------------------->|
-  |                                |
-  |              Revoke            |   (server-initiated preemption)
-  |<-------------------------------|
-  |                                |
-  |        Release {resource}      |   (the revoke acknowledgment)
-  |------------------------------->|
-  |                                |
-  |              Grant             |   to the next waiter
-  |<-------------------------------|
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant S as server
+    C->>S: connect(@sgc)
+    S-->>C: Advertise {available_resources}
+    C->>S: Acquire {resource}
+    alt resource free
+        S-->>C: Grant {resource} + fd (SCM_RIGHTS)
+        C->>S: Ack (confirms receipt of Grant + fd)
+    else owned by another / by the requester
+        S-->>C: Deny {reason}
+    end
+    Note over C,S: a queued Acquire gets no immediate reply —<br/>the Grant arrives when the resource frees
+    opt voluntary release
+        C->>S: Release {resource}
+    end
+    opt preemption (ask-first, 5s grace)
+        S-->>C: Revoke {resource}
+        C->>S: Release {resource} (the revoke acknowledgment)
+        S-->>C: Grant {resource} to the next waiter
+    end
 ```
 
 On connect the server immediately sends `Advertise` (no hello handshake).

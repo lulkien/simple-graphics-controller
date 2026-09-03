@@ -22,28 +22,13 @@ the `wire_dump` golden bytes.
 
 ## Architecture
 
-```
-        +----------------------------------------------+
-        |                 libsgc core (Rust)            |
-        |  SgcClient: pump-based, no background threads |
-        |  - connect/acquire  (blocking request/answer) |
-        |  - pump(): one frame -> Option<SgcEvent>      |
-        |  - revoke/regrant lifecycle, Ack, fd lending  |
-        +----------------------------------------------+
-                    |                        |
-         native use |                C ABI (libsgc-c)
-                    v                        v
-        Rust apps (crate)      +----------------------------+
-                               |  include/libsgc.h          |
-                               |  opaque sgc_client* handle |
-                               |  sgc_* functions           |
-                               +----------------------------+
-                                             |
-                          +------------------+------------------+
-                          |                                     |
-                          v                                     v
-                    C apps (kmscube-style)      C++ RAII wrapper (sgc.hpp,
-                                               header-only, move-only)
+```mermaid
+flowchart TD
+    Core["libsgc core (Rust)<br/>SgcClient: pump-based, no background threads<br/>- connect/acquire (blocking request/answer)<br/>- pump(): one frame → Option&lt;SgcEvent&gt;<br/>- revoke/regrant lifecycle, Ack, fd lending"]
+    Core -->|"native use"| Rust["Rust apps (crate)"]
+    Core -->|"C ABI (libsgc-c)"| CApi["include/libsgc.h<br/>opaque sgc_client* handle<br/>sgc_* functions"]
+    CApi --> C["C apps (kmscube-style)"]
+    CApi --> CPP["C++ RAII wrapper<br/>(sgc.hpp, header-only, move-only)"]
 ```
 
 The core owns all protocol state. Handles are opaque; fds cross the ABI as
@@ -102,13 +87,39 @@ boundary.
 The callback convenience (`start_event_loop`) is a thin wrapper that calls
 `pump(None)` in a loop and dispatches `SgcEvent` to the app's `FnMut`.
 
+### Errors
+
+`SgcError` (thiserror) is the one error type crossing the crate boundary —
+apps match on it directly (no `anyhow` inside a public API):
+
+| site | variant |
+| ---- | ------- |
+| connect: no server / refused | `ConnectFailed(io)` |
+| connect: bad frame / non-`Advertise` first message | `Protocol` / `UnexpectedMessage` |
+| fail-fast: resource not offered | `NotAvailable { resource }` |
+| acquire: server deny | `Denied { reason }` |
+| acquire: grant without exactly 1 fd | `Io(InvalidData)` |
+| acquire/pump: wire failure | `Io` |
+| any: frame decode | `Protocol` |
+| `fd()` of a resource not held | `NotHeld { resource }` |
+
+EOF inside the event loop is normal teardown, not an app-facing error: pump
+drains the held resources as `Revoked` events and then returns the error.
+
+### Open items
+
+- Voluntary `release()` (hand a resource back without waiting for a revoke):
+  check `held`, write `Release`, drop the canonical. The server currently
+  reclaims on disconnect or preemption only.
+
 ## The C ABI
 
 `libsgc-c` is a shim crate: `#[repr(C)]` types + `#[unsafe(no_mangle)]`
 `extern "C"` functions over the core, `catch_unwind` at every entry point.
 The library name is `sgc`, so consumers link `libsgc.a` / `libsgc.so` —
-built with the rest of the workspace (`just build` for the host,
-`just build-gnu-aarch64` for the board).
+built with the rest of the workspace (`just build` for the host, `just build-gnu-aarch64` for the board — both
+dynamically linked against the platform libc (linkage convention: musl
+targets are fully static, gnu targets are dynamic).
 
 Resource kinds are flat ints — the input classes are distinct kinds so
 kind+index is a total round-trip encoding of the 3-level Rust enum:
@@ -161,9 +172,9 @@ Rules that keep the ABI honest:
 - Enums are plain `int` constants, not C enums, so ABI size is stable.
 
 The header is handwritten (the surface is ~6 functions + 2 structs);
-cbindgen earns its keep only if the surface grows. The host build emits
-`libsgc.a` + `libsgc.so`; the aarch64 build is static-only (`crt-static`
-drops the cdylib) — board consumers link `libsgc.a`.
+cbindgen earns its keep only if the surface grows. Both host and aarch64
+builds emit `libsgc.a` + `libsgc.so` (linkage convention: musl = fully
+static, gnu = dynamic).
 
 ## The C++ face
 
@@ -207,6 +218,11 @@ same tested core.
   the full grant / ask-first revoke / requeue / re-grant / resume cycle
   against the real daemon — kmscube survives preemption and rebuilds its
   display stack on the re-granted lease fd.
+- The Rust demos also run on fbdev (sgc-fbdev-client). One linfb quirk
+  shaped that demo: `Framebuffer::open_with_fd` takes the fd and the
+  mmap outlives the fd (the mapping holds the file description), so the
+  renderer is built once and kept across revoke/regrant — a cycle just
+  redraws, no reopen.
 
 ## Source layout
 

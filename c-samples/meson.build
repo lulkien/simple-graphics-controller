@@ -1,17 +1,19 @@
 # sgc-drm-c / sgc-drm-cpp: minimal C and C++ sample clients for libsgc.
 #
 # They link the C ABI statically: libsgc.a is taken from the
-# simple-graphics-controller repo's cargo target dir (built with
-# `cargo build --release -p libsgc-c`). The samples themselves only need
-# the kernel DRM UAPI headers (linux-libc-dev) — the drawing is raw
-# ioctls (drmdraw.c), no GBM/EGL, no libdrm linked.
+# simple-graphics-controller repo's cargo target dir, debug or release per
+# the meson buildtype, plus the aarch64 triple when cross-building
+# (host debug: `cargo build -p libsgc-c`; release: `cargo build --release
+# -p libsgc-c`; board: `just build-gnu-aarch64`). The samples themselves
+# only need the kernel DRM UAPI headers (linux-libc-dev) — the drawing is
+# raw ioctls (drmdraw.c), no GBM/EGL, no libdrm linked.
 #
 # Host:   meson setup build && meson compile -C build
 # Board:  meson setup build-aarch64 --cross-file=aarch64-cross.txt \
 #           -Dbuildtype=release -Dsgc_dir=/abs/path/to/simple-graphics-controller
 project('sgc-c-samples', 'c', 'cpp',
   version : '0.1.0',
-  license : 'MIT',
+  license : 'Unlicense',
   default_options : ['c_std=gnu99', 'cpp_std=c++17', 'warning_level=2'])
 
 sgc_dir = get_option('sgc_dir')

@@ -89,18 +89,45 @@ Use the `just` recipes:
 
 ```sh
 just build                 # host dynamic release build (workspace)
-just build-gnu-aarch64     # fully static aarch64 (gnu) build
+just build-gnu-aarch64     # dynamic aarch64 (gnu) build
+just build-musl-aarch64    # fully static aarch64 musl build
 just dist-gnu-aarch64      # aarch64 build + strip + copy into ./dist
 just clean                 # remove ./target and ./dist
 ```
 
-`just build-gnu-aarch64` produces fully static binaries (static glibc via
-`crt-static` + static font libs via pkg-config) that run on any aarch64
-Linux with no packages installed. It requires the static archive variants of
-the font libs on the build host (`libfreetype-dev:arm64`,
-`libfontconfig-dev:arm64`, `libexpat1-dev:arm64`, `libpng-dev:arm64`,
-`zlib1g-dev:arm64`, `libbrotli-dev:arm64`, `libbz2-dev:arm64`,
-`libc6-dev:arm64`).
+Linkage convention: musl targets are fully static; gnu targets are
+dynamically linked against the platform libc (the board runs glibc).
+`just build-gnu-aarch64` needs the arm64 -dev packages on the build host
+only for the fbdev demo's font libs, which are linked statically via
+pkg-config (`libfreetype-dev:arm64`, `libfontconfig-dev:arm64`,
+`libexpat1-dev:arm64`, `libpng-dev:arm64`, `zlib1g-dev:arm64`,
+`libbrotli-dev:arm64`, `libbz2-dev:arm64`); the daemon itself links nothing
+but glibc.
+
+### Cross toolchains
+
+All three targets add their Rust std first (`rustup target add
+aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-unknown-linux-musl`).
+`.cargo/config.toml` names the C linkers it expects on `PATH`
+(`aarch64-unknown-linux-gnu-gcc`, `aarch64-unknown-linux-musl-gcc`);
+symlink them into `~/.cargo/bin`.
+
+- **aarch64 gnu (dynamic)**: Debian packages `gcc-aarch64-linux-gnu`,
+  `binutils-aarch64-linux-gnu`, plus the `:arm64` -dev font packages above.
+  Symlink `~/.cargo/bin/aarch64-unknown-linux-gnu-gcc` ->
+  `/usr/bin/aarch64-linux-gnu-gcc`.
+- **aarch64 musl (fully static)**: the cross gcc comes from musl.cc
+  (<https://musl.cc/aarch64-linux-musl-cross.tgz>): extract it (creates
+  `~/aarch64-linux-musl-cross/`), then symlink
+  `~/.cargo/bin/aarch64-unknown-linux-musl-gcc` ->
+  `~/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc`. The font -sys
+  crates build their vendored sources for musl, so no system font libs are
+  needed. (musl.cc toolchains are self-contained — no root required.)
+- **x86_64 musl (fully static)**: no cross gcc needed — `crt-static` (from
+  `.cargo/config.toml`) links against the musl objects rustup installed, via
+  the host `cc`.
+- **strip**: the dist recipes use `x86_64-linux-gnu-strip` and
+  `aarch64-linux-gnu-strip` (binutils / binutils-aarch64-linux-gnu).
 
 Equivalent plain cargo for the daemon alone (no font deps):
 
@@ -118,11 +145,42 @@ target/aarch64-unknown-linux-gnu/release/sgc-fbdev-client             # fbdev de
 dist/                                                                 # stripped copies
 ```
 
+## Packaging (.deb)
+
+`cargo-deb` (install once: `cargo install cargo-deb`) builds two installable
+packages per architecture from the release artifacts:
+
+| package                   | contents                                                            | Multi-Arch |
+| ------------------------- | ------------------------------------------------------------------- | ---------- |
+| simple-graphics-controller| daemon (`/usr/bin`) + runtime `libsgc.so` (`/usr/lib`)               | no — ships a bin |
+| libsgc-dev                | `libsgc.h` + `sgc.hpp` (`/usr/include`) + static `libsgc.a` (multiarch lib dir); Depends on the server package | same |
+
+```sh
+just deb                # amd64 packages into target/debian/
+just deb-gnu-aarch64    # arm64 packages into target/debian/
+```
+
+The demo/sample clients (`rust-samples/`, `c-samples/`) are deliberately NOT
+packaged — build them from source if you want to try one.
+
+Debian policy forbids a Multi-Arch: same package from mixing a `/usr/bin`
+binary with a library, so only `libsgc-dev` is built with `--multiarch`
+(its `.a` lands in `/usr/lib/<triple>/`); the server package installs the
+`.so` at plain `/usr/lib` and is not multiarch. Both recipes run with
+`--no-build` — they package whatever the matching
+`build`/`build-gnu-aarch64` produced, resolved through the magic
+`target/release` asset prefix (see the manifests' comments). The arm64 pair
+is install-tested on the dev board (single `dpkg -i`, daemon runs from
+`/usr/bin`).
+
 ## Runtime dependencies on the target board
 
-- **Server (static build)**: none. The binaries are self-contained.
-- **Demo clients (static build)**: none; the dynamically-linked fbdev
-  clients need `libfontconfig.so.1` etc. (see the dist `file` output).
+- **Server (musl build)**: none — fully static. The gnu/dynamic builds
+  need glibc (present on Armbian).
+- **Demo clients (musl)**: none. The aarch64 gnu builds embed the font
+  libs statically (pkg-config `--static`); the host's `just build` fbdev
+  demo links them dynamically and needs `libfontconfig.so.1` etc. (see the
+  dist `file` output).
 - **DRM lease clients** (e.g. kmscube built with `-L`): need
   libdrm/gbm/EGL/GLES on the board; they talk to `@sgc`, not the card.
 

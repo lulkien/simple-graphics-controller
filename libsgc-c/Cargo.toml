@@ -1,7 +1,9 @@
 [package]
 name = "libsgc-c"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI for libsgc: libsgc.h/sgc.hpp headers plus the sgc shared and static libraries"
 
 # The C library: libsgc.a (static) + libsgc.so (shared), exporting the
 # sgc_* ABI declared in include/libsgc.h.
@@ -12,3 +14,20 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 libsgc-rs = { path = "../libsgc-rs" }
 libc = "0.2"
+
+# --- .deb packaging (cargo-deb) -----------------------------------------
+# libsgc-dev: headers + the static archive; the runtime libsgc.so lives in
+# the simple-graphics-controller package (Depends below). Assets are
+# explicit so the cdylib is NOT auto-added here (path conflicts otherwise).
+[package.metadata.deb]
+maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
+name = "libsgc-dev"
+section = "libdevel"
+depends = "$auto, simple-graphics-controller"
+assets = [
+    ["include/libsgc.h", "usr/include/libsgc.h", "644"],
+    ["include/sgc.hpp", "usr/include/sgc.hpp", "644"],
+    # Magic "target/release" prefix (see the server package) so the static
+    # archive resolves per-arch under --target cross builds.
+    ["target/release/libsgc.a", "usr/lib/libsgc.a", "644"],
+]
