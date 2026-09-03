@@ -22,28 +22,13 @@ the `wire_dump` golden bytes.
 
 ## Architecture
 
-```
-        +----------------------------------------------+
-        |                 libsgc core (Rust)            |
-        |  SgcClient: pump-based, no background threads |
-        |  - connect/acquire  (blocking request/answer) |
-        |  - pump(): one frame -> Option<SgcEvent>      |
-        |  - revoke/regrant lifecycle, Ack, fd lending  |
-        +----------------------------------------------+
-                    |                        |
-         native use |                C ABI (libsgc-c)
-                    v                        v
-        Rust apps (crate)      +----------------------------+
-                               |  include/libsgc.h          |
-                               |  opaque sgc_client* handle |
-                               |  sgc_* functions           |
-                               +----------------------------+
-                                             |
-                          +------------------+------------------+
-                          |                                     |
-                          v                                     v
-                    C apps (kmscube-style)      C++ RAII wrapper (sgc.hpp,
-                                               header-only, move-only)
+```mermaid
+flowchart TD
+    Core["libsgc core (Rust)<br/>SgcClient: pump-based, no background threads<br/>- connect/acquire (blocking request/answer)<br/>- pump(): one frame → Option&lt;SgcEvent&gt;<br/>- revoke/regrant lifecycle, Ack, fd lending"]
+    Core -->|"native use"| Rust["Rust apps (crate)"]
+    Core -->|"C ABI (libsgc-c)"| CApi["include/libsgc.h<br/>opaque sgc_client* handle<br/>sgc_* functions"]
+    CApi --> C["C apps (kmscube-style)"]
+    CApi --> CPP["C++ RAII wrapper<br/>(sgc.hpp, header-only, move-only)"]
 ```
 
 The core owns all protocol state. Handles are opaque; fds cross the ABI as

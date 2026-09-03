@@ -104,6 +104,31 @@ pkg-config (`libfreetype-dev:arm64`, `libfontconfig-dev:arm64`,
 `libbrotli-dev:arm64`, `libbz2-dev:arm64`); the daemon itself links nothing
 but glibc.
 
+### Cross toolchains
+
+All three targets add their Rust std first (`rustup target add
+aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-unknown-linux-musl`).
+`.cargo/config.toml` names the C linkers it expects on `PATH`
+(`aarch64-unknown-linux-gnu-gcc`, `aarch64-unknown-linux-musl-gcc`);
+symlink them into `~/.cargo/bin`.
+
+- **aarch64 gnu (dynamic)**: Debian packages `gcc-aarch64-linux-gnu`,
+  `binutils-aarch64-linux-gnu`, plus the `:arm64` -dev font packages above.
+  Symlink `~/.cargo/bin/aarch64-unknown-linux-gnu-gcc` ->
+  `/usr/bin/aarch64-linux-gnu-gcc`.
+- **aarch64 musl (fully static)**: the cross gcc comes from musl.cc
+  (<https://musl.cc/aarch64-linux-musl-cross.tgz>): extract it (creates
+  `~/aarch64-linux-musl-cross/`), then symlink
+  `~/.cargo/bin/aarch64-unknown-linux-musl-gcc` ->
+  `~/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc`. The font -sys
+  crates build their vendored sources for musl, so no system font libs are
+  needed. (musl.cc toolchains are self-contained — no root required.)
+- **x86_64 musl (fully static)**: no cross gcc needed — `crt-static` (from
+  `.cargo/config.toml`) links against the musl objects rustup installed, via
+  the host `cc`.
+- **strip**: the dist recipes use `x86_64-linux-gnu-strip` and
+  `aarch64-linux-gnu-strip` (binutils / binutils-aarch64-linux-gnu).
+
 Equivalent plain cargo for the daemon alone (no font deps):
 
 ```sh
