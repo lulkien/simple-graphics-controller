@@ -28,3 +28,22 @@ drm = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+# --- .deb packaging (cargo-deb) -----------------------------------------
+# The server package: the daemon + the runtime shared libsgc.so (apps that
+# link libsgc dynamically need only this package). The daemon is the
+# default-features build (drm + input); a fbdev-only server is a separate
+# concern.
+[package.metadata.deb]
+maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
+name = "simple-graphics-controller"
+section = "admin"
+depends = "$auto"
+assets = [
+    "$auto",
+    # "target/release" sources are remapped to the actual target dir by
+    # cargo-deb when building with --target (cross toolchains). The
+    # aarch64 runtime .so is built without crt-static (which drops the
+    # cdylib) — see the deb-gnu-aarch64 recipe.
+    ["../target/release/libsgc.so", "usr/lib/libsgc.so", "644"],
+]

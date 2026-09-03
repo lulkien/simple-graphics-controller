@@ -12,3 +12,18 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 libsgc-rs = { path = "../libsgc-rs" }
 libc = "0.2"
+
+# --- .deb packaging (cargo-deb) -----------------------------------------
+# libsgc-dev: headers + the static archive; the runtime libsgc.so lives in
+# the simple-graphics-controller package (Depends below). Assets are
+# explicit so the cdylib is NOT auto-added here (path conflicts otherwise).
+[package.metadata.deb]
+maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
+name = "libsgc-dev"
+section = "libdevel"
+depends = "$auto, simple-graphics-controller"
+assets = [
+    ["include/libsgc.h", "usr/include/libsgc.h", "644"],
+    ["include/sgc.hpp", "usr/include/sgc.hpp", "644"],
+    ["../target/release/libsgc.a", "usr/lib/libsgc.a", "644"],
+]

@@ -132,8 +132,9 @@ drains the held resources as `Revoked` events and then returns the error.
 `libsgc-c` is a shim crate: `#[repr(C)]` types + `#[unsafe(no_mangle)]`
 `extern "C"` functions over the core, `catch_unwind` at every entry point.
 The library name is `sgc`, so consumers link `libsgc.a` / `libsgc.so` —
-built with the rest of the workspace (`just build` for the host,
-`just build-gnu-aarch64` for the board).
+built with the rest of the workspace (`just build` for the host, `just build-gnu-aarch64` for the board — both
+dynamically linked against the platform libc (linkage convention: musl
+targets are fully static, gnu targets are dynamic).
 
 Resource kinds are flat ints — the input classes are distinct kinds so
 kind+index is a total round-trip encoding of the 3-level Rust enum:
@@ -186,9 +187,9 @@ Rules that keep the ABI honest:
 - Enums are plain `int` constants, not C enums, so ABI size is stable.
 
 The header is handwritten (the surface is ~6 functions + 2 structs);
-cbindgen earns its keep only if the surface grows. The host build emits
-`libsgc.a` + `libsgc.so`; the aarch64 build is static-only (`crt-static`
-drops the cdylib) — board consumers link `libsgc.a`.
+cbindgen earns its keep only if the surface grows. Both host and aarch64
+builds emit `libsgc.a` + `libsgc.so` (linkage convention: musl = fully
+static, gnu = dynamic).
 
 ## The C++ face
 

@@ -89,18 +89,20 @@ Use the `just` recipes:
 
 ```sh
 just build                 # host dynamic release build (workspace)
-just build-gnu-aarch64     # fully static aarch64 (gnu) build
+just build-gnu-aarch64     # dynamic aarch64 (gnu) build
+just build-musl-aarch64    # fully static aarch64 musl build
 just dist-gnu-aarch64      # aarch64 build + strip + copy into ./dist
 just clean                 # remove ./target and ./dist
 ```
 
-`just build-gnu-aarch64` produces fully static binaries (static glibc via
-`crt-static` + static font libs via pkg-config) that run on any aarch64
-Linux with no packages installed. It requires the static archive variants of
-the font libs on the build host (`libfreetype-dev:arm64`,
-`libfontconfig-dev:arm64`, `libexpat1-dev:arm64`, `libpng-dev:arm64`,
-`zlib1g-dev:arm64`, `libbrotli-dev:arm64`, `libbz2-dev:arm64`,
-`libc6-dev:arm64`).
+Linkage convention: musl targets are fully static; gnu targets are
+dynamically linked against the platform libc (the board runs glibc).
+`just build-gnu-aarch64` needs the arm64 -dev packages on the build host
+only for the fbdev demo's font libs, which are linked statically via
+pkg-config (`libfreetype-dev:arm64`, `libfontconfig-dev:arm64`,
+`libexpat1-dev:arm64`, `libpng-dev:arm64`, `zlib1g-dev:arm64`,
+`libbrotli-dev:arm64`, `libbz2-dev:arm64`); the daemon itself links nothing
+but glibc.
 
 Equivalent plain cargo for the daemon alone (no font deps):
 
@@ -120,9 +122,12 @@ dist/                                                                 # stripped
 
 ## Runtime dependencies on the target board
 
-- **Server (static build)**: none. The binaries are self-contained.
-- **Demo clients (static build)**: none; the dynamically-linked fbdev
-  clients need `libfontconfig.so.1` etc. (see the dist `file` output).
+- **Server (musl build)**: none — fully static. The gnu/dynamic builds
+  need glibc (present on Armbian).
+- **Demo clients (musl)**: none. The aarch64 gnu builds embed the font
+  libs statically (pkg-config `--static`); the host's `just build` fbdev
+  demo links them dynamically and needs `libfontconfig.so.1` etc. (see the
+  dist `file` output).
 - **DRM lease clients** (e.g. kmscube built with `-L`): need
   libdrm/gbm/EGL/GLES on the board; they talk to `@sgc`, not the card.
 
