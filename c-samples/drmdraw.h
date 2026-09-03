@@ -1,7 +1,9 @@
 /*
  * drmdraw.h — minimal dumb-buffer modeset glue for the C/C++ sample
- * clients (no libdrm, no C deps beyond libc; mirrors the ioctl pattern of
- * the Rust sgc-drm-client render task).
+ * clients. Structs and ioctl numbers come from the kernel DRM UAPI
+ * headers (<drm/drm.h>, <drm/drm_mode.h> — linux-libc-dev); the ioctls
+ * are raw ioctl(2) calls, no libdrm/GBM/EGL is linked (mirrors the
+ * ioctl pattern of the Rust sgc-drm-client render task).
  *
  * The fd is a DRM lease fd from the controller: the server holds DRM
  * master and grants each client a lease over the card's objects, so the

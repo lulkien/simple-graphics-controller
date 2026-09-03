@@ -141,7 +141,8 @@ dist/                                                                 # stripped
 C (`sgc-drm-c`, libsgc.h) and one in C++ (`sgc-drm-cpp`, sgc.hpp) — built
 with meson, linking `libsgc.a` statically. Each connects, acquires the first
 advertised DRM card, and draws a simple animated pattern on the lease fd
-(dumb buffer + SETCRTC, raw ioctls — no GBM/EGL/libdrm). The patterns differ
+(dumb buffer + SETCRTC via raw ioctls using the kernel DRM UAPI headers —
+no GBM/EGL, no libdrm linked). The patterns differ
 (cycling gradient + orange square vs phase-shifting checkerboard + cyan
 stripe) so the two are distinguishable on the display. Both survive the
 revoke/requeue/re-grant cycle like the Rust demo client.

@@ -2,9 +2,9 @@
 #
 # They link the C ABI statically: libsgc.a is taken from the
 # simple-graphics-controller repo's cargo target dir (built with
-# `cargo build --release -p libsgc-c` / `just build-libsgc`). The samples
-# themselves have no dependencies beyond libc — the DRM drawing is raw
-# ioctls (drmdraw.c), no GBM/EGL/libdrm.
+# `cargo build --release -p libsgc-c`). The samples themselves only need
+# the kernel DRM UAPI headers (linux-libc-dev) — the drawing is raw
+# ioctls (drmdraw.c), no GBM/EGL, no libdrm linked.
 #
 # Host:   meson setup build && meson compile -C build
 # Board:  meson setup build-aarch64 --cross-file=aarch64-cross.txt \
