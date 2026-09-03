@@ -90,15 +90,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.start_event_loop(|event| match event {
         SgcEvent::Revoked { resource } => {
             if Some(&resource) == mouse.as_ref() {
+                println!("revoked {resource:?}; stopping input");
                 let _ = input_tx.send(InputCmd::Stop);
             } else {
+                println!("revoked {resource:?}; stopping render");
                 let _ = render_tx.send(RenderCmd::Stop { resource });
             }
         }
         SgcEvent::Granted { resource, fd } => {
             if Some(&resource) == mouse.as_ref() {
+                println!("re-granted {resource:?}; reading input");
                 let _ = input_tx.send(InputCmd::Start { fd });
             } else {
+                println!("re-granted {resource:?}; drawing");
                 let _ = render_tx.send(RenderCmd::Draw { resource, fd });
             }
         }

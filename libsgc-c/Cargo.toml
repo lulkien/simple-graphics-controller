@@ -1,0 +1,14 @@
+[package]
+name = "libsgc-c"
+version = "0.1.0"
+edition = "2024"
+
+# The C library: libsgc.a (static) + libsgc.so (shared), exporting the
+# sgc_* ABI declared in include/libsgc.h.
+[lib]
+name = "sgc"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+libsgc-rs = { path = "../libsgc-rs" }
+libc = "0.2"

@@ -8,14 +8,18 @@ library plus demo clients draw via the granted fd (fbdev mmap or a DRM lease).
 
 ## Workspace layout
 
-| crate                        | description                                        |
-| ---------------------------- | -------------------------------------------------- |
-| `simple-graphics-controller` | daemon: owns resources, serves clients on `@sgc`   |
-| `simple-graphics-protocol`   | shared protocol: messages, serialization (msgpack) |
-| `libsgc-rs`                  | client library: connect, acquire, revoke/regrant   |
-| `sgc-drm-client`             | demo client: acquires a DRM card, modesets on it   |
-| `sgc-fbdev-client`           | demo client: acquires the fbdev resource, draws    |
-| `sgc-fbdev-client-2`         | second fbdev demo (preemption/showcase)            |
+| crate                          | description                                        |
+| ------------------------------ | -------------------------------------------------- |
+| `simple-graphics-controller`   | daemon: owns resources, serves clients on `@sgc`   |
+| `simple-graphics-protocol`     | shared protocol: messages, serialization (msgpack) |
+| `libsgc-rs`                    | client library: connect, acquire, revoke/regrant   |
+| `libsgc-c`                     | C ABI shim over the core (libsgc.h / sgc.hpp)      |
+| `rust-samples/sgc-drm-client`  | demo client: acquires a DRM card, modesets on it   |
+| `rust-samples/sgc-fbdev-client`| demo client: acquires the fbdev resource, draws    |
+
+The Rust demo clients live under `rust-samples/` (cargo workspace members —
+built by `just build` / `just dist-*` like any crate). The C and C++ sample
+clients live under `c-samples/` (meson, see below).
 
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md) — the reference for
 implementing clients in other languages (e.g. kmscube's C lease client).
@@ -26,6 +30,8 @@ Design documents:
   (fbdev/drm/input), registries, DRM lease state machine
 - [policy-engine.md](policy-engine.md) — windowing policy engine:
   preemption, waiter queues, policies
+- [libsgc.md](libsgc.md) — client library: one Rust core, Rust + C ABI +
+  C++ faces (pump-based)
 
 ## Backends are Cargo features
 
@@ -126,8 +132,34 @@ dist/                                                                 # stripped
    `drm` + `input` by default).
 2. Run a client: `./sgc-drm-client` (acquires the first advertised DRM card),
    `./sgc-fbdev-client` (needs a server built with `--all-features` and a
-   working framebuffer), or an external lease client like
-   `kmscube -L -A -N`.
+   working framebuffer), an external lease client like `kmscube -L -A -N`,
+   or one of the C/C++ sample clients below.
+
+## C/C++ sample clients (c-samples/)
+
+`c-samples/` holds two minimal sample clients over the libsgc C ABI — one in
+C (`sgc-drm-c`, libsgc.h) and one in C++ (`sgc-drm-cpp`, sgc.hpp) — built
+with meson, linking `libsgc.a` statically. Each connects, acquires the first
+advertised DRM card, and draws a simple animated pattern on the lease fd
+(dumb buffer + SETCRTC via raw ioctls using the kernel DRM UAPI headers —
+no GBM/EGL, no libdrm linked). The patterns differ
+(cycling gradient + orange square vs phase-shifting checkerboard + cyan
+stripe) so the two are distinguishable on the display. Both survive the
+revoke/requeue/re-grant cycle like the Rust demo client.
+
+```sh
+# host build (debug profile picks up libsgc.a from ../target/debug —
+# build it first with `cargo build -p libsgc-c`; use -Dbuildtype=release
+# and `just build` for a release lib)
+cd c-samples && meson setup build && meson compile -C build
+
+# board build (static libsgc.a from the aarch64 workspace build,
+# i.e. `just build-gnu-aarch64` -> target/aarch64-unknown-linux-gnu/release)
+cd c-samples
+meson setup build-aarch64 --cross-file=aarch64-cross.txt -Dbuildtype=release \
+  -Dsgc_dir=/abs/path/to/simple-graphics-controller
+meson compile -C build-aarch64
+```
 
 Logging is controlled by `RUST_LOG` (default: `info`):
 

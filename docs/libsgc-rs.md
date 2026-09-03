@@ -8,10 +8,10 @@ The client OWNS the granted fds (one canonical per resource) and LENDS dups to
 the app; the canonical is dropped on revoke or disconnect, so the library
 cannot leak a resource the app forgot about.
 
-Validated end-to-end in the `sgc-fbdev-client` and `sgc-fbdev-client-2` demos
-(same architecture, different scenes), both linked against this crate:
-connect, acquire, full preemption cycle on host + aarch64 board with a real
-`/dev/fb0`.
+Validated end-to-end in the `sgc-drm-client` and `sgc-fbdev-client` demos
+(same architecture, different resources/scenes), both linked against this
+crate: connect, acquire, full preemption cycle on host + aarch64 board with
+a real `/dev/fb0` / DRM card.
 
 ## Single-threaded by design
 
@@ -141,7 +141,6 @@ comes from a lend (`fd()`) or a `Granted` event, never from `acquire()`.
 - `sgc-fbdev-client`: bouncing-rect scene; main + `logic` + `render` +
   `timer` (16ms logic / 33ms draw timers on one loop; `RenderCmd` adds
   `Exit`) + `input` (evdev mouse watcher).
-- `sgc-fbdev-client-2`: checkerboard scene; main + `render`.
 
 ## Renderer constraints (linfb)
 

@@ -497,9 +497,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libsgc-c"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libsgc-rs",
+]
+
+[[package]]
 name = "libsgc-rs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sendfd",
  "simple-graphics-protocol",
  "thiserror",
@@ -995,14 +1004,6 @@ name = "sgc-fbdev-client"
 version = "0.1.0"
 dependencies = [
  "libc",
- "libsgc-rs",
- "linfb",
-]
-
-[[package]]
-name = "sgc-fbdev-client-2"
-version = "0.1.0"
-dependencies = [
  "libsgc-rs",
  "linfb",
 ]

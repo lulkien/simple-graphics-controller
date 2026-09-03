@@ -1,9 +1,0 @@
-[package]
-name = "sgc-fbdev-client"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-libsgc-rs = { path = "../libsgc-rs" }
-linfb = { git = "https://github.com/lulkien/linfb" }
-libc = "0.2"

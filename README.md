@@ -11,3 +11,5 @@ All documentation lives in [docs/](docs/):
   preemption, waiter queues, policies
 - [resource-manager](docs/resource-manager.md) — backend features
   (fbdev/drm/input), registries, DRM lease state machine
+- [libsgc](docs/libsgc.md) — client library: one Rust core, Rust + C ABI +
+  C++ faces (pump-based)

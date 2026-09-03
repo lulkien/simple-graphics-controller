@@ -7,3 +7,6 @@ edition = "2024"
 simple-graphics-protocol = { path = "../simple-graphics-protocol" }
 sendfd = "0.4.4"
 thiserror = "1"
+# poll(2) for the pump's bounded wait (set_read_timeout cannot express
+# "poll once" / "block forever": SO_RCVTIMEO treats 0 as no timeout).
+libc = "0.2"
