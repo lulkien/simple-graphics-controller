@@ -15,7 +15,6 @@ library plus demo clients draw via the granted fd (fbdev mmap or a DRM lease).
 | `libsgc-rs`                  | client library: connect, acquire, revoke/regrant   |
 | `sgc-drm-client`             | demo client: acquires a DRM card, modesets on it   |
 | `sgc-fbdev-client`           | demo client: acquires the fbdev resource, draws    |
-| `sgc-fbdev-client-2`         | second fbdev demo (preemption/showcase)            |
 
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md) — the reference for
 implementing clients in other languages (e.g. kmscube's C lease client).
@@ -128,8 +127,30 @@ dist/                                                                 # stripped
    `drm` + `input` by default).
 2. Run a client: `./sgc-drm-client` (acquires the first advertised DRM card),
    `./sgc-fbdev-client` (needs a server built with `--all-features` and a
-   working framebuffer), or an external lease client like
-   `kmscube -L -A -N`.
+   working framebuffer), an external lease client like `kmscube -L -A -N`,
+   or one of the C/C++ sample clients below.
+
+## C/C++ sample clients (c-samples/)
+
+`c-samples/` holds two minimal sample clients over the libsgc C ABI — one in
+C (`sgc-drm-c`, libsgc.h) and one in C++ (`sgc-drm-cpp`, sgc.hpp) — built
+with meson, linking `libsgc.a` statically. Each connects, acquires the first
+advertised DRM card, and draws a simple animated pattern on the lease fd
+(dumb buffer + SETCRTC, raw ioctls — no GBM/EGL/libdrm). The patterns differ
+(cycling gradient + orange square vs phase-shifting checkerboard + cyan
+stripe) so the two are distinguishable on the display. Both survive the
+revoke/requeue/re-grant cycle like the Rust demo client.
+
+```sh
+# host build (libsgc.a from ../target/debug — build it first with `just build-libsgc`)
+cd c-samples && meson setup build && meson compile -C build
+
+# board build (static libsgc.a from `just build-libsgc-aarch64`)
+cd c-samples
+meson setup build-aarch64 --cross-file=aarch64-cross.txt -Dbuildtype=release \
+  -Dsgc_dir=/abs/path/to/simple-graphics-controller
+meson compile -C build-aarch64
+```
 
 Logging is controlled by `RUST_LOG` (default: `info`):
 

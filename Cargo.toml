@@ -3,7 +3,6 @@ members = [
     "simple-graphics-controller",
     "simple-graphics-protocol",
     "sgc-fbdev-client",
-    "sgc-fbdev-client-2",
     "sgc-drm-client",
     "libsgc-c",
     "libsgc-rs",
