@@ -24,15 +24,6 @@ default: build
 build:
     cargo build --release --workspace
 
-# The libsgc C ABI (libsgc-c crate): libsgc.a + libsgc.so. Consumers build
-# against the repo (kmscube: meson -Dsgc_dir=...) so the artifacts are not
-# part of dist/; these recipes just build them for the current host / board.
-build-libsgc:
-    cargo build --release -p libsgc-c
-
-build-libsgc-aarch64:
-    cargo build --release --target {{TARGET_GNU_AARCH64}} -p libsgc-c
-
 # arm64 system libs (freetype/fontconfig/expat for linfb) live in the arm64
 # pkg-config dir; allow cross-linking against them. crt-static comes from
 # .cargo/config.toml, so both targets build fully static.

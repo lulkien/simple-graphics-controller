@@ -106,8 +106,9 @@ The callback convenience (`start_event_loop`) is a thin wrapper that calls
 
 `libsgc-c` is a shim crate: `#[repr(C)]` types + `#[unsafe(no_mangle)]`
 `extern "C"` functions over the core, `catch_unwind` at every entry point.
-The library name is `sgc`, so consumers link `libsgc.a` / `libsgc.so`
-(`just build-libsgc` / `just build-libsgc-aarch64`).
+The library name is `sgc`, so consumers link `libsgc.a` / `libsgc.so` —
+built with the rest of the workspace (`just build` for the host,
+`just build-gnu-aarch64` for the board).
 
 Resource kinds are flat ints — the input classes are distinct kinds so
 kind+index is a total round-trip encoding of the 3-level Rust enum:
