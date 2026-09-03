@@ -5,6 +5,7 @@ members = [
     "sgc-fbdev-client",
     "sgc-fbdev-client-2",
     "sgc-drm-client",
+    "libsgc-c",
     "libsgc-rs",
 ]
 resolver = "2"
