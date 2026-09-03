@@ -26,6 +26,8 @@ Design documents:
   (fbdev/drm/input), registries, DRM lease state machine
 - [policy-engine.md](policy-engine.md) — windowing policy engine:
   preemption, waiter queues, policies
+- [libsgc.md](libsgc.md) — client library: one Rust core, Rust + C ABI +
+  C++ faces (pump-based)
 
 ## Backends are Cargo features
 
