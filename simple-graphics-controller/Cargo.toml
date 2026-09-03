@@ -1,8 +1,8 @@
 [package]
 name = "simple-graphics-controller"
-version = "0.1.0"
-edition = "2024"
-license = "Unlicense"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Resource daemon that leases DRM/fbdev display and input devices to clients over the @sgc socket"
 
 [features]

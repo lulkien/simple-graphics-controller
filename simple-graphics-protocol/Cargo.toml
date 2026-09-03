@@ -1,8 +1,8 @@
 [package]
 name = "simple-graphics-protocol"
-version = "0.1.0"
-edition = "2024"
-license = "Unlicense"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Message protocol shared between the sgc daemon and its clients"
 
 [dependencies]

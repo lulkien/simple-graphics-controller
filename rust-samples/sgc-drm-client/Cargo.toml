@@ -1,8 +1,8 @@
 [package]
 name = "sgc-drm-client"
-version = "0.1.0"
-edition = "2024"
-license = "Unlicense"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "DRM demo client for simple-graphics-controller"
 
 [dependencies]
