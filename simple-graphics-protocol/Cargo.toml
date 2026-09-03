@@ -2,6 +2,8 @@
 name = "simple-graphics-protocol"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "Message protocol shared between the sgc daemon and its clients"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

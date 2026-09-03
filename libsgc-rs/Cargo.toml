@@ -2,6 +2,8 @@
 name = "libsgc-rs"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "Rust client library for the simple-graphics-controller daemon"
 
 [dependencies]
 simple-graphics-protocol = { path = "../simple-graphics-protocol" }

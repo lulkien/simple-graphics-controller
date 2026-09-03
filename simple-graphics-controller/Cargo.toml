@@ -2,6 +2,8 @@
 name = "simple-graphics-controller"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "Resource daemon that leases DRM/fbdev display and input devices to clients over the @sgc socket"
 
 [features]
 # Backends are compile-time features: a build includes exactly the backends
@@ -38,12 +40,17 @@ tokio = { version = "1", features = ["test-util"] }
 maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
 name = "simple-graphics-controller"
 section = "admin"
+# NOT Multi-Arch: same — this package ships the daemon (/usr/bin) next to
+# the runtime lib, which Debian policy forbids in a multiarch package.
+# Ship the .so at the plain /usr/lib (vendor-style) and call cargo-deb
+# without --multiarch (see the deb recipes).
 depends = "$auto"
 assets = [
     "$auto",
-    # "target/release" sources are remapped to the actual target dir by
-    # cargo-deb when building with --target (cross toolchains). The
-    # aarch64 runtime .so is built without crt-static (which drops the
-    # cdylib) — see the deb-gnu-aarch64 recipe.
-    ["../target/release/libsgc.so", "usr/lib/libsgc.so", "644"],
+    # "target/release" is the magic prefix: cargo-deb resolves it inside the
+    # workspace target dir, honoring --target (cross) and the profile. The
+    # daemon crate lives one level under the workspace, so the magic form is
+    # required — a "../target/release/..." path is treated as a plain file
+    # relative to the crate and silently resolves to the *host* artifact.
+    ["target/release/libsgc.so", "usr/lib/libsgc.so", "644"],
 ]

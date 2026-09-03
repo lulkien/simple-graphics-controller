@@ -2,6 +2,8 @@
 name = "sgc-drm-client"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "DRM demo client for simple-graphics-controller"
 
 [dependencies]
 libsgc-rs = { path = "../../libsgc-rs" }

@@ -2,6 +2,8 @@
 name = "sgc-fbdev-client"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "fbdev demo client for simple-graphics-controller"
 
 [dependencies]
 libsgc-rs = { path = "../../libsgc-rs" }

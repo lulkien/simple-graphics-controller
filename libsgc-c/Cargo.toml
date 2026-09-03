@@ -2,6 +2,8 @@
 name = "libsgc-c"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "C ABI for libsgc: libsgc.h/sgc.hpp headers plus the sgc shared and static libraries"
 
 # The C library: libsgc.a (static) + libsgc.so (shared), exporting the
 # sgc_* ABI declared in include/libsgc.h.
@@ -25,5 +27,7 @@ depends = "$auto, simple-graphics-controller"
 assets = [
     ["include/libsgc.h", "usr/include/libsgc.h", "644"],
     ["include/sgc.hpp", "usr/include/sgc.hpp", "644"],
-    ["../target/release/libsgc.a", "usr/lib/libsgc.a", "644"],
+    # Magic "target/release" prefix (see the server package) so the static
+    # archive resolves per-arch under --target cross builds.
+    ["target/release/libsgc.a", "usr/lib/libsgc.a", "644"],
 ]
