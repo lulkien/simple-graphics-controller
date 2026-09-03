@@ -145,6 +145,34 @@ target/aarch64-unknown-linux-gnu/release/sgc-fbdev-client             # fbdev de
 dist/                                                                 # stripped copies
 ```
 
+## Packaging (.deb)
+
+`cargo-deb` (install once: `cargo install cargo-deb`) builds two installable
+packages per architecture from the release artifacts:
+
+| package                   | contents                                                            | Multi-Arch |
+| ------------------------- | ------------------------------------------------------------------- | ---------- |
+| simple-graphics-controller| daemon (`/usr/bin`) + runtime `libsgc.so` (`/usr/lib`)               | no — ships a bin |
+| libsgc-dev                | `libsgc.h` + `sgc.hpp` (`/usr/include`) + static `libsgc.a` (multiarch lib dir); Depends on the server package | same |
+
+```sh
+just deb                # amd64 packages into target/debian/
+just deb-gnu-aarch64    # arm64 packages into target/debian/
+```
+
+The demo/sample clients (`rust-samples/`, `c-samples/`) are deliberately NOT
+packaged — build them from source if you want to try one.
+
+Debian policy forbids a Multi-Arch: same package from mixing a `/usr/bin`
+binary with a library, so only `libsgc-dev` is built with `--multiarch`
+(its `.a` lands in `/usr/lib/<triple>/`); the server package installs the
+`.so` at plain `/usr/lib` and is not multiarch. Both recipes run with
+`--no-build` — they package whatever the matching
+`build`/`build-gnu-aarch64` produced, resolved through the magic
+`target/release` asset prefix (see the manifests' comments). The arm64 pair
+is install-tested on the dev board (single `dpkg -i`, daemon runs from
+`/usr/bin`).
+
 ## Runtime dependencies on the target board
 
 - **Server (musl build)**: none — fully static. The gnu/dynamic builds
