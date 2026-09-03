@@ -67,9 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // disown everything. Blocks until the connection ends.
     client.start_event_loop(|event| match event {
         SgcEvent::Revoked { resource } => {
+            println!("revoked {resource:?}; stopping render");
             let _ = render_tx.send(RenderCmd::Stop { resource });
         }
         SgcEvent::Granted { resource, fd } => {
+            println!("re-granted {resource:?}; drawing");
             let _ = render_tx.send(RenderCmd::Draw { resource, fd });
         }
     });

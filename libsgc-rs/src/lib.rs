@@ -3,10 +3,11 @@
 //! Apps link this crate and drive a [`SgcClient`]: connect (returns the
 //! advertised resources), acquire a resource (the client HOLDS the granted
 //! fd), borrow it via [`SgcClient::fd`] (a dup, never the canonical), and
-//! run the event loop with a callback for revokes / re-grants. All wire
-//! work (framing, SCM_RIGHTS fd passing, `Ack`, the `Revoke` handshake)
-//! happens synchronously on the app's own thread — no background threads,
-//! no shared state.
+//! pump for events ([`SgcClient::pump`] — one frame per call, the shape C
+//! and C++ faces also drive; [`SgcClient::start_event_loop`] is the
+//! callback convenience wrapper). All wire work (framing, SCM_RIGHTS fd
+//! passing, `Ack`, the `Revoke` handshake) happens synchronously on the
+//! app's own thread — no background threads, no shared state.
 //!
 //! Client-side resource ownership: the client owns the granted fds (one
 //! per resource) and lends them out; the canonical is dropped on revoke or
