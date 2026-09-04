@@ -1,18 +1,22 @@
-// Demo: acquire a DRM lease from the simple-graphics-controller daemon (@sgc)
-// and render a Slint UI on the granted lease fd via the linuxkms backend with an
-// injected device fd (BackendBuilder::with_drm_device, sgc-lease branch work).
+// Demo: run a Slint UI on a DRM lease granted by the simple-graphics-controller
+// daemon (@sgc), via the linuxsgc backend (branch sgc-lease-1.17 fork work).
+//
+// The backend owns the whole @sgc session: BackendBuilder::default().build()
+// connects to the daemon and acquires the card lease, and the backend's event
+// loop pumps the session — a revoke suspends rendering until the lease is
+// re-granted (display stack rebuilt), no app involvement. This app never sees
+// SgcClient; it only builds the linuxsgc backend and runs.
 //
 // Renderer chosen by cargo feature: default = software (musl static builds),
-// `--features femtovg` = OpenGL over gbm/EGL (gnu dynamic builds).
-//
-// The SgcClient is deliberately kept alive (not dropped) for the whole run so
-// the daemon keeps the lease granted. Pumping for Revoke/regrant is phase 2.
+// `--features femtovg` = OpenGL over gbm/EGL (gnu dynamic builds). The GL
+// renderer cannot be rebuilt in-process (its EGL/GL context dies with the lease
+// fd), so the femtovg flavor exits with an error when preempted — documented
+// limitation of the backend.
 
-use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use anyhow::Context;
-use libsgc_rs::{Resource, SgcClient};
+
 slint::slint! {
     export component MainWindow inherits Window {
         background: #10131f;
@@ -32,7 +36,7 @@ slint::slint! {
             color: #9aa0b5;
             font-size: 20px;
             font-family: "DejaVu Sans";
-            text: "display fd came from the @sgc daemon, not /dev/dri";
+            text: "the linuxsgc backend owns the @sgc session, not this app";
         }
         Rectangle {
             y: parent.height * 0.5 - 70px;
@@ -62,36 +66,11 @@ slint::slint! {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Phase 1: acquire once, render, hold. No pumping yet — nothing else
-    // contends for the card, so no Revoke arrives.
-    let (client, advertised) =
-        SgcClient::connect().context("connecting to @sgc (is the daemon running?)")?;
-    let mut client = client;
-
-    let (card, resource) = advertised
-        .iter()
-        .find_map(|r| match r {
-            Resource::Drm { card } => Some((*card, r.clone())),
-            _ => None,
-        })
-        .context("the daemon advertised no DRM card")?;
-    println!("advertised resources: {advertised:?}");
-    println!("acquiring Drm{{ card: {card} }}...");
-
-    client.acquire(resource.clone()).context("acquire denied or failed")?;
-    let lease_fd = client.fd(&resource).context("granted fd not held")?;
-    let fl = nix::fcntl::fcntl(&lease_fd, nix::fcntl::FcntlArg::F_GETFL)
-        .map_err(|e| anyhow::anyhow!("F_GETFL: {e}"))?;
-    println!(
-        "lease fd {} granted (oflags 0x{fl:x}, O_NONBLOCK={})",
-        lease_fd.as_raw_fd(),
-        fl & nix::fcntl::OFlag::O_NONBLOCK.bits() != 0
-    );
-
+    // sgc or die: this connects to @sgc and acquires the card lease. Without a
+    // running daemon the backend build fails and the app exits here.
     let backend = i_slint_backend_linuxsgc::BackendBuilder::default()
-        .with_drm_device(card, lease_fd)
         .build()
-        .context("linuxkms backend init")?;
+        .context("linuxsgc backend init: is the @sgc daemon running?")?;
     slint::platform::set_platform(Box::new(backend)).context("set_platform")?;
 
     // Register fonts WITHOUT fontconfig: a fully static musl binary cannot
@@ -103,23 +82,23 @@ fn main() -> anyhow::Result<()> {
 
     let ui = MainWindow::new().context("creating the UI window")?;
 
-    // Keep the sgc connection alive for the backend's lifetime; dropping it at
-    // exit lets the daemon reclaim (revoke) the lease.
-    let _connection = client;
-
+    // Bounce the square. Runs even while a revoke suspends rendering — the
+    // backend just skips frames until the lease is re-granted, then continues.
     let ui_weak = ui.as_weak();
-    let timer = slint::Timer::default();
     let mut phase: f32 = 0.0;
-    timer.start(slint::TimerMode::Repeated, Duration::from_millis(33), move || {
-        phase += 0.07;
-        // Bounce the square across ~90% of a 1920-wide screen.
-        let x = 1720.0 * (0.5 + 0.5 * phase.sin());
-        if let Some(ui) = ui_weak.upgrade() {
-            ui.set_anim_x(x);
-        }
-    });
+    let animation = slint::Timer::default();
+    animation.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(33),
+        move || {
+            phase += 0.07;
+            let x = 1720.0 * (0.5 + 0.5 * phase.sin());
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_anim_x(x);
+            }
+        },
+    );
 
-    println!("running event loop...");
     ui.run().context("event loop failed")?;
     Ok(())
 }
@@ -127,12 +106,11 @@ fn main() -> anyhow::Result<()> {
 /// Load a font file into the process-global fontique collection used by the
 /// text pipeline. Returns the number of fonts registered.
 fn register_font(path: &str) -> anyhow::Result<usize> {
-    use slint::fontique_011::fontique;
+    use slint::fontique_010::fontique;
 
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading font file {path}"))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading font file {path}"))?;
     let blob = fontique::Blob::new(std::sync::Arc::new(bytes));
-    let mut collection = slint::fontique_011::shared_collection();
+    let mut collection = slint::fontique_010::shared_collection();
     let fonts = collection.register_fonts(blob, None);
     println!("registered {} font(s) from {path}", fonts.len());
     Ok(fonts.len())
