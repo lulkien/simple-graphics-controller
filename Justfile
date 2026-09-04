@@ -69,25 +69,21 @@ clean:
     rm -rf target dist
 
 # --- Debian packages (cargo-deb; install with `cargo install cargo-deb`) ---
-# Produces two packages in target/debian/ per architecture:
-#   simple-graphics-controller  daemon + runtime libsgc.so (/usr/lib)
-#   libsgc-dev                  headers + static libsgc.a (multiarch lib dir;
-#                               depends on the above)
+# Produces the daemon package in target/debian/ per architecture:
+#   simple-graphics-controller  the daemon (/usr/bin) — daemon-only since the
+#                               repo split; the client library packaging
+#                               (libsgc-dev headers + libsgc.a, and the
+#                               runtime libsgc.so) lives in the libsgc-c repo.
 # The demo/sample clients are deliberately NOT packaged — build them from
 # source (rust-samples/, c-samples/).
 # deb              host packages (amd64)
 # deb-gnu-aarch64  board packages (arm64)
 #
 # The server package ships a /usr/bin daemon, so it is NOT Multi-Arch: same
-# (policy forbids mixing bins and libs there); only libsgc-dev gets
-# --multiarch. Both recipes depend on the release builds, whose artifacts
-# the deb metadata picks up via the magic "target/release" asset prefix.
+# (policy forbids mixing bins and libs there).
 
 deb: build
     cargo deb --manifest-path simple-graphics-controller/Cargo.toml --no-build
-    cargo deb --manifest-path libsgc-c/Cargo.toml --no-build --multiarch=same
 
 deb-gnu-aarch64: build-gnu-aarch64
-    # Dynamic gnu build produces the runtime libsgc.so and libsgc.a natively.
     cargo deb --target {{TARGET_GNU_AARCH64}} --no-build --manifest-path simple-graphics-controller/Cargo.toml
-    cargo deb --target {{TARGET_GNU_AARCH64}} --no-build --multiarch=same --manifest-path libsgc-c/Cargo.toml

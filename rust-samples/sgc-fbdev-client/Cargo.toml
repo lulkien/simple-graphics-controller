@@ -6,6 +6,6 @@ license.workspace = true
 description = "fbdev demo client for simple-graphics-controller"
 
 [dependencies]
-libsgc-rs = { path = "../../libsgc-rs" }
+libsgc-rs = { git = "https://github.com/lulkien/libsgc-rs.git" }
 linfb = { git = "https://github.com/lulkien/linfb" }
 libc = "0.2"

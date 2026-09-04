@@ -1,2 +1,0 @@
-# Standalone crate: own build output (the repo-root .gitignore only covers /target)
-/target

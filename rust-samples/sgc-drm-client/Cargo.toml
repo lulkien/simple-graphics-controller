@@ -6,5 +6,5 @@ license.workspace = true
 description = "DRM demo client for simple-graphics-controller"
 
 [dependencies]
-libsgc-rs = { path = "../../libsgc-rs" }
+libsgc-rs = { git = "https://github.com/lulkien/libsgc-rs.git" }
 libc = "0.2"

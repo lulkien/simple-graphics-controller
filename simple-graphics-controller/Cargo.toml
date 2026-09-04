@@ -16,7 +16,7 @@ drm = ["dep:drm"]
 input = ["dep:evdev"]
 
 [dependencies]
-simple-graphics-protocol = { path = "../simple-graphics-protocol" }
+simple-graphics-protocol = { git = "https://github.com/lulkien/simple-graphics-protocol.git" }
 tokio = { version = "1", features = ["full"] }
 nix = { version = "0.29", features = ["fs", "socket", "uio"] }
 sendfd = { version = "0.4.4", features = ["tokio"] }
@@ -40,17 +40,11 @@ tokio = { version = "1", features = ["test-util"] }
 maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
 name = "simple-graphics-controller"
 section = "admin"
-# NOT Multi-Arch: same — this package ships the daemon (/usr/bin) next to
-# the runtime lib, which Debian policy forbids in a multiarch package.
-# Ship the .so at the plain /usr/lib (vendor-style) and call cargo-deb
-# without --multiarch (see the deb recipes).
+# NOT Multi-Arch: same — this package ships the daemon (/usr/bin), which
+# Debian policy forbids in a multiarch package. Since the repo split the
+# daemon package is daemon-only; the client library (headers, libsgc.a,
+# runtime libsgc.so) is packaged from the libsgc-c repo.
 depends = "$auto"
 assets = [
     "$auto",
-    # "target/release" is the magic prefix: cargo-deb resolves it inside the
-    # workspace target dir, honoring --target (cross) and the profile. The
-    # daemon crate lives one level under the workspace, so the magic form is
-    # required — a "../target/release/..." path is treated as a plain file
-    # relative to the crate and silently resolves to the *host* artifact.
-    ["target/release/libsgc.so", "usr/lib/libsgc.so", "644"],
 ]
