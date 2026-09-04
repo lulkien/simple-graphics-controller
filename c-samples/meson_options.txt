@@ -1,6 +1,0 @@
-option(
-  'sgc_dir',
-  type : 'string',
-  value : '..',
-  description : 'Path to the simple-graphics-controller checkout (default: this repo, one level up). libsgc.a is taken from <sgc_dir>/target[/aarch64-unknown-linux-gnu]/<debug|release> per build type.'
-)

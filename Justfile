@@ -11,7 +11,8 @@
 #   just clean               remove ./target and ./dist
 
 # All shipped binaries; the dist recipes copy/strip/file exactly these.
-BINS := "simple-graphics-controller sgc-fbdev-client sgc-drm-client"
+# (The demo clients moved to the sgc-demos repo; only the daemon ships here.)
+BINS := "simple-graphics-controller"
 
 TARGET_GNU_AARCH64 := "aarch64-unknown-linux-gnu"
 TARGET_MUSL_AMD64 := "x86_64-unknown-linux-musl"
@@ -74,8 +75,8 @@ clean:
 #                               repo split; the client library packaging
 #                               (libsgc-dev headers + libsgc.a, and the
 #                               runtime libsgc.so) lives in the libsgc-c repo.
-# The demo/sample clients are deliberately NOT packaged — build them from
-# source (rust-samples/, c-samples/).
+# The demo clients are deliberately NOT packaged — they live in the sgc-demos
+# repo; build them from source.
 # deb              host packages (amd64)
 # deb-gnu-aarch64  board packages (arm64)
 #

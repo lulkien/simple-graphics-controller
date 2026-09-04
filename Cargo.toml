@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "simple-graphics-controller",
-    "rust-samples/sgc-drm-client",
-    "rust-samples/sgc-fbdev-client",
 ]
 resolver = "2"
 
