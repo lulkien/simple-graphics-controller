@@ -1,15 +1,14 @@
 # simple-graphics-controller
 
 Graphics resource controller for Linux. A daemon owns graphics resources and
-hands them out to clients over an abstract Unix socket (`@sgc`).
+hands them out to clients over an abstract Unix socket (`@sgc`). This repo
+ships only the daemon; the wire contract, client libraries and demos live in
+sibling repos (see [docs/README.md](docs/README.md) — "Ecosystem").
 
-All documentation lives in [docs/](docs/):
+Design docs in [docs/](docs/):
 
-- [README](docs/README.md) — project overview, build, usage
-- [PROTOCOL](docs/PROTOCOL.md) — wire protocol specification
-- [policy-engine](docs/policy-engine.md) — windowing policy engine:
-  preemption, waiter queues, policies
-- [resource-manager](docs/resource-manager.md) — backend features
-  (fbdev/drm/input), registries, DRM lease state machine
-- [libsgc](docs/libsgc.md) — client library: one Rust core, Rust + C ABI +
-  C++ faces (pump-based)
+- [README](docs/README.md) — what it does, backends, build/run, ecosystem
+- [policy-engine](docs/policy-engine.md) — windowing policy: preemption,
+  waiter queues, policies
+- [resource-manager](docs/resource-manager.md) — backends (fbdev/drm/input),
+  registries, DRM lease state machine
