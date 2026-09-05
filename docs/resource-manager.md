@@ -7,7 +7,8 @@ time.
 Source: `simple-graphics-controller/src/resource_manager/`. The arbitration of
 *who owns what* is the policy engine ([policy-engine.md](policy-engine.md)),
 which is orthogonal: it sees only the advertised resource list and never
-touches device nodes. The wire format is [PROTOCOL.md](PROTOCOL.md).
+touches device nodes. The wire format is specified in the protocol crate's
+`docs/PROTOCOL.md` (repo: simple-graphics-protocol).
 
 ## Backends are compile-time features
 
