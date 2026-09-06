@@ -15,21 +15,22 @@ Policies are `FirstOwner` (first acquirer keeps it, others denied),
 ```mermaid
 flowchart LR
     subgraph TaskA["connection task (per client)"]
-        SA["owns stream A<br/>sends Revoke/Grant on the wire"]
+        SA["owns stream A<br/>writes Revoke/Grant on the wire"]
     end
     subgraph TaskB["connection task (per client)"]
         SB["owns stream B"]
     end
     subgraph Engine["policy engine — ONE task, owns ALL state"]
         E["run_engine loop"]
-        SL["slots: Resource -> Slot{owner, waiters, revoke_deadline}"]
-        CR["control registry: ClientId -> channel"]
+        SL["slots:<br/>Resource -> Slot{owner, waiters, revoke_deadline}"]
+        CR["control registry:<br/>ClientId -> channel"]
     end
-    TaskA -- "EngineCommand<br/>(Register/Acquire/Release/Disconnected)" --> E
-    TaskB --> E
-    E -- "ControlMessage<br/>(Revoke / Grant)" --> CR
-    CR -- "ControlMessage<br/>(Revoke / Grant)" --> TaskA
-    CR --> TaskB
+    TaskA -- "EngineCommand<br/>(Register / Acquire / Release / Disconnected)" --> E
+    TaskB -- "EngineCommand" --> E
+    E -- "owns + mutates<br/>(sole owner)" --> SL
+    E -- "owns (lookup for<br/>revoke/grant targets)" --> CR
+    E -- "ControlMessage<br/>(Revoke / Grant)<br/>pushed into the client's channel" --> TaskA
+    E -- "ControlMessage<br/>(Revoke / Grant)" --> TaskB
 ```
 
 Each client connection is a tokio task that owns its stream. The engine is a
