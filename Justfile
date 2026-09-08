@@ -84,7 +84,7 @@ clean:
 # (policy forbids mixing bins and libs there).
 
 deb: build
-    cargo deb --manifest-path simple-graphics-controller/Cargo.toml --no-build
+    cargo deb --no-build
 
 deb-gnu-aarch64: build-gnu-aarch64
-    cargo deb --target {{TARGET_GNU_AARCH64}} --no-build --manifest-path simple-graphics-controller/Cargo.toml
+    cargo deb --target {{TARGET_GNU_AARCH64}} --no-build

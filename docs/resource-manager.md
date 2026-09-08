@@ -4,7 +4,7 @@ The daemon's resource layer: how each backend (fbdev, DRM, input) is opened,
 registered, granted, and reclaimed — and how backends are selected at build
 time.
 
-Source: `simple-graphics-controller/src/resource_manager/`. The arbitration of
+Source: `src/resource_manager/`. The arbitration of
 *who owns what* is the policy engine ([policy-engine.md](policy-engine.md)),
 which is orthogonal: it sees only the advertised resource list and never
 touches device nodes. The wire format is specified in the protocol crate's

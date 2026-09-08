@@ -4,7 +4,7 @@ How the `simple-graphics-controller` policy engine works: the mechanism that
 arbitrates resource ownership (revoke handshake, waiter queues, timeouts),
 with the policies that decide who wins.
 
-Source: `simple-graphics-controller/src/windowing.rs` — `Policy`,
+Source: `src/windowing/` — `Policy`,
 `PolicyEngine`, `Slot`, `handle_command`, `grant_next`, `force_reclaim`.
 Policies are `FirstOwner` (first acquirer keeps it, others denied),
 `LatestOwner` (newest acquirer preempts; waiters served newest-first) and
