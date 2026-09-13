@@ -67,8 +67,8 @@ just                          # release build (drm + input), or:
 cargo build --release
 just build-gnu-aarch64        # board: gnu dynamic
 just build-musl-aarch64       # board: fully static musl
-just dist-gnu-aarch64         # + strip into ./dist
-just deb-gnu-aarch64          # cargo-deb board package
+just packages                 # installable .debs (4 flavors) into target/debian/
+just ci                       # the gate: fmt + clippy + tests + packages
 ```
 
 Run as **root** (it opens `/dev/dri` + `/dev/input`):
@@ -76,6 +76,17 @@ Run as **root** (it opens `/dev/dri` + `/dev/input`):
 ```sh
 RUST_LOG=info ./target/release/simple-graphics-controller
 ```
+
+On a device, install the package instead — it ships the binary plus the systemd
+unit and enables it at boot:
+
+```sh
+dpkg -i simple-graphics-controller_*_arm64.deb
+systemctl status simple-graphics-controller
+```
+
+See [docs/packaging.md](docs/packaging.md) for the flavors and the board
+drop-in for a binary kept in `/root`.
 
 Tests (policy units, engine actor, full wire e2e over a real abstract
 socket): `cargo test`.
@@ -86,6 +97,8 @@ socket): `cargo test`.
   state machine, preemption handoff, the three policies step by step
 - [docs/resource-manager.md](docs/resource-manager.md) — backends, feature
   gating, registries, DRM lease state machine, revoke handoff
+- [docs/packaging.md](docs/packaging.md) — .deb flavors, install on a device,
+  the systemd unit, boards that run the binary from `/root`
 
 ## Ecosystem
 

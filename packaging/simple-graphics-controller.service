@@ -1,0 +1,57 @@
+[Unit]
+Description=simple-graphics-controller (@sgc) - DRM/fbdev/input resource broker
+Documentation=https://github.com/lulkien/simple-graphics-controller
+# @sgc clients are sgc-or-die: a client takes a lease from this daemon or fails
+# to start. Clients therefore use After=/Requires=simple-graphics-controller.service
+# (or Wants=, if they may come up without a screen).
+#
+# The daemon opens /dev/dri/card0 (and card1 when present), so it is ordered after
+# the device units: without that a boot-time start races udev, fails to acquire
+# DRM master, and the reliable-looking Restart= policy gives up within seconds.
+After=systemd-udevd.service systemd-modules-load.service dev-dri-card0.device
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/simple-graphics-controller
+
+# The daemon opens /dev/dri and /dev/input directly (no libseat) and must take
+# DRM master, so it runs as root. Do NOT add PrivateDevices=yes or
+# DevicePolicy=closed here: they hide the very devices this daemon brokers.
+User=root
+Group=root
+
+Environment=RUST_LOG=info
+
+# One lease per resource: a crash leaves clients without a screen, so a
+# restarting service is the desired behaviour rather than a quiet death. The
+# LVGL driver and the Slint linuxsgc backend both retry and re-attach after the
+# daemon comes back; simpler clients need a restart of their own. The rate limit
+# is loosened from the default (5 starts / 10s): a device that is not ready yet
+# deserves about a minute of retries, after which a real crash loop stops and
+# logs instead of spinning.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=12
+
+# Leases pass fds to clients over the abstract @sgc socket; leave headroom.
+LimitNOFILE=4096
+
+# Mild hardening - the daemon needs the devices and its socket, nothing else.
+# CapabilityBoundingSet is deliberately left alone: DRM master and raw input
+# need the privileges of a root process.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

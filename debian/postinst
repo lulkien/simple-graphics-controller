@@ -1,0 +1,28 @@
+#!/bin/sh
+# Installed by the simple-graphics-controller package: make the daemon usable
+# straight after `dpkg -i` - reload the unit, enable it at boot, start it.
+#
+# Enabling is unconditional on configure, and that is deliberate. Clients are
+# sgc-or-die, so a device with the package installed but the daemon stopped has no
+# screen. It also has to survive one flavor replacing another: dpkg runs the
+# removed package's prerm first, which disables the unit, so a "keep the previous
+# state" check (deb-systemd-helper was-enabled) would leave the replacement
+# disabled - which is exactly how the first packaged install came up dead on the
+# board after the musl package replaced the glibc one.
+set -e
+
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+    deb-systemd-helper unmask simple-graphics-controller.service >/dev/null || true
+    systemctl --system enable simple-graphics-controller.service >/dev/null || true
+    deb-systemd-helper update-state simple-graphics-controller.service >/dev/null || true
+
+    # Restart on upgrade so the new binary actually runs; start it otherwise.
+    # A start that fails because the device is not ready yet is not fatal: the
+    # unit is enabled and carries a restart policy.
+    if systemctl is-active --quiet simple-graphics-controller.service; then
+        systemctl --system restart simple-graphics-controller.service || true
+    else
+        systemctl --system start simple-graphics-controller.service || true
+    fi
+fi

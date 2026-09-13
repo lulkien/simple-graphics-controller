@@ -45,6 +45,40 @@ section = "admin"
 # daemon package is daemon-only; the client library (headers, libsgc.a,
 # runtime libsgc.so) is packaged from the libsgc-c repo.
 depends = "$auto"
+maintainer-scripts = "debian/"
+# The flavors are alternatives, and the conflict has to be declared on *both*
+# sides: with it only on the musl package, installing musl removes the glibc one
+# (that side resolves), but installing the glibc package over musl fails with a
+# file conflict on /usr/bin and the unit - "trying to overwrite ... which is also
+# in package simple-graphics-controller-musl". Replaces lets the swap through.
+conflicts = "simple-graphics-controller-musl"
+replaces = "simple-graphics-controller-musl"
 assets = [
     "$auto",
+    # systemd unit: started at boot, restarted on failure. Kept in packaging/,
+    # not dist/ - dist/ is gitignored build output, so a fresh clone could not
+    # build the package. Board builds that run the binary from elsewhere
+    # (e.g. /root) override ExecStart with a drop-in - see docs/packaging.md.
+    ["packaging/simple-graphics-controller.service", "lib/systemd/system/simple-graphics-controller.service", "644"],
 ]
+
+# Cross-target flavors cannot run dpkg-shlibdeps against the target's libraries,
+# so each states its runtime dependency explicitly. Native builds keep $auto.
+# See the package-* recipes in the Justfile.
+[package.metadata.deb.variants.gnu-aarch64]
+depends = "libc6"
+
+# Fully static musl: no runtime dependencies at all. It carries its own package
+# name (and declares itself an alternative to the glibc build) for two reasons:
+# cargo-deb derives its output filename from name_version_arch whatever
+# --variant says, so two flavors for one architecture would be the same file and
+# the later build would replace the earlier one; and the two flavors install onto
+# the same paths, which dpkg refuses unless the packages declare the conflict.
+#
+# One variant, both architectures: it is used by the aarch64 and x86_64 musl
+# recipes, which differ only by --target (and therefore by Debian architecture).
+[package.metadata.deb.variants.musl]
+name = "simple-graphics-controller-musl"
+depends = ""
+conflicts = "simple-graphics-controller"
+replaces = "simple-graphics-controller"

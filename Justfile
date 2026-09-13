@@ -8,6 +8,8 @@
 #   just dist-musl-x86_64    musl build + strip + copy into ./dist
 #   just dist-musl-aarch64   aarch64 musl build + strip + copy into ./dist
 #   just dist-gnu-aarch64    aarch64 build + strip + copy into ./dist
+#   just packages            all four installable .debs (binary + systemd unit)
+#   just ci                  the gate: fmt + clippy + tests + packages
 #   just clean               remove ./target and ./dist
 
 # All shipped binaries; the dist recipes copy/strip/file exactly these.
@@ -69,22 +71,64 @@ dist-gnu-aarch64: build-gnu-aarch64
 clean:
     rm -rf target dist
 
-# --- Debian packages (cargo-deb; install with `cargo install cargo-deb`) ---
-# Produces the daemon package in target/debian/ per architecture:
-#   simple-graphics-controller  the daemon (/usr/bin) — daemon-only since the
-#                               repo split; the client library packaging
-#                               (libsgc-dev headers + libsgc.a, and the
-#                               runtime libsgc.so) lives in the libsgc-c repo.
-# The demo clients are deliberately NOT packaged — they live in the sgc-demos
-# repo; build them from source.
-# deb              host packages (amd64)
-# deb-gnu-aarch64  board packages (arm64)
+# --- packages: installable .debs (daemon binary + systemd unit) ------------
 #
-# The server package ships a /usr/bin daemon, so it is NOT Multi-Arch: same
-# (policy forbids mixing bins and libs there).
+# Four flavors, one per target the fleet runs:
+#   package-gnu-x86_64    amd64, dynamically linked glibc - workstations
+#   package-musl-x86_64   amd64, fully static musl - workstations without glibc
+#   package-gnu-aarch64   arm64, dynamically linked glibc - the boards
+#   package-musl-aarch64  arm64, fully static musl - boards whose glibc differs
+#
+# Every package installs /usr/bin/simple-graphics-controller and
+# /lib/systemd/system/simple-graphics-controller.service, enables the service at
+# boot and starts it (see debian/postinst). The glibc and musl flavors are
+# alternatives, not companions: they own the same paths. The daemon package is
+# daemon-only since the repo split; the client library packaging (libsgc-dev
+# headers + libsgc.a, runtime libsgc.so) lives in the libsgc-c repo.
+#
+# Cross packaging cannot run dpkg-shlibdeps against the target's libraries, so
+# the variants in Cargo.toml state each flavor's runtime dependency explicitly.
+#
+#   just packages                all four .debs into target/debian/
+#   just package-musl-aarch64    just one
+#   just deb-info <file.deb>     what a package installs and depends on
 
-deb: build
+# Each flavor's package name (and therefore its output filename) differs, so the
+# packages cannot collide: cargo-deb derives the filename from name_version_arch
+# whatever --variant says, and it rewrites target/debian when it packages -
+# renaming afterwards is a race the next flavor wins. The glibc and musl builds
+# for one architecture share nothing but the version; the musl package carries its
+# own name and declares itself an alternative to the glibc package (see the
+# variants in Cargo.toml).
+package-gnu-x86_64: build
     cargo deb --no-build
 
-deb-gnu-aarch64: build-gnu-aarch64
-    cargo deb --target {{TARGET_GNU_AARCH64}} --no-build
+package-musl-x86_64: build-musl-x86_64
+    cargo deb --no-build --target {{TARGET_MUSL_AMD64}} --variant musl
+
+package-gnu-aarch64: build-gnu-aarch64
+    cargo deb --no-build --target {{TARGET_GNU_AARCH64}} --variant gnu-aarch64
+
+package-musl-aarch64: build-musl-aarch64
+    cargo deb --no-build --target aarch64-unknown-linux-musl --variant musl
+
+packages: package-gnu-x86_64 package-musl-x86_64 package-gnu-aarch64 package-musl-aarch64
+    @echo "built:"
+    @ls -1 target/debian/*.deb
+
+# Show what a package installs and what it depends on.
+deb-info file:
+    dpkg-deb -c {{file}} | grep -E "usr/bin|systemd" || true
+    dpkg-deb -I {{file}} | grep -E "^ (Package|Version|Architecture|Depends)" || true
+
+# --- the gate ---------------------------------------------------------------
+# Same on a workstation and on a runner: format, lints, tests, then build every
+# package flavor, leaving the .debs in target/debian/.
+ci: check test packages
+
+check:
+    cargo fmt --check
+    cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+    cargo test --workspace
