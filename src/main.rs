@@ -67,14 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // adopted later are offered to the engine with the same policy.
     #[cfg(feature = "input")]
     tokio::spawn(hotplug::run(
-        inventory.registries.clone(),
-        inventory.input_index.clone(),
+        inventory.holdings.clone(),
         advertised.clone(),
         engine.clone(),
         policy,
     ));
 
-    // `resources` (with the DRM masters inside registries.drm) stays alive
-    // for the whole run: closing a master destroys its leases.
-    server::run(engine, inventory.registries, advertised).await
+    // The holdings (with the DRM masters inside them) stay alive for the whole
+    // run: closing a master destroys its leases.
+    server::run(engine, inventory.holdings, advertised).await
 }
