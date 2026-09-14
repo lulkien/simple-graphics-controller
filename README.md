@@ -131,6 +131,8 @@ socket): `cargo test`.
 | sgc-demos | standalone demo clients |
 | slint | fork with the `linuxsgc` backend (lease-or-die session) |
 
-All cross-repo deps are git refs; no workspace spans repos.
+All cross-repo deps are version deps on published crates or git refs; no
+workspace spans repos. The protocol comes from crates.io, with the sibling path
+used when the whole workspace is checked out side by side.
 
 <sub>* `/dev/fb0` only when built with `--features fbdev`.</sub>
