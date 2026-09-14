@@ -3,8 +3,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(feature = "input")]
+use crate::resource_manager::hotplug;
 use crate::{
     resource_manager::query_resource,
+    types::AdvertisedResources,
     windowing::{Policy, PolicyEngine},
 };
 use anyhow::Context;
@@ -33,8 +36,13 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting simple-graphics-controller");
     let resources = query_resource();
-    let advertised = Arc::new(resources.advertised);
-    debug!("Advertised resources (priority order): {advertised:?}");
+    // Advertised list: shared and mutable, because the input reconciler adds
+    // and drops resources as devices come and go.
+    let advertised = Arc::new(AdvertisedResources::new(resources.advertised));
+    debug!(
+        "Advertised resources (priority order): {:?}",
+        advertised.snapshot()
+    );
 
     // Window policy: SGC_POLICY env, default fair-queue. One policy for all
     // registered resources (per-resource override map is a future knob).
@@ -48,11 +56,23 @@ async fn main() -> anyhow::Result<()> {
 
     // One policy per advertised resource (covers Fbdev, Drm, and Input).
     let policies: HashMap<Resource, Policy> = advertised
-        .iter()
-        .cloned()
+        .snapshot()
+        .into_iter()
         .map(|resource| (resource, policy))
         .collect();
     let engine = PolicyEngine::spawn(policies);
+
+    // Input devices are not a boot-time snapshot: adopt the ones plugged in
+    // while the server runs, and withdraw the ones that go away. Resources
+    // adopted later are offered to the engine with the same policy.
+    #[cfg(feature = "input")]
+    tokio::spawn(hotplug::run(
+        resources.registries.clone(),
+        resources.input_index.clone(),
+        advertised.clone(),
+        engine.clone(),
+        policy,
+    ));
 
     // `resources` (with the DRM masters inside registries.drm) stays alive
     // for the whole run: closing a master destroys its leases.

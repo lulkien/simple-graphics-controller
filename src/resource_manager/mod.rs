@@ -17,6 +17,8 @@ mod drm;
 #[cfg(feature = "fbdev")]
 mod fbdev;
 #[cfg(feature = "input")]
+pub mod hotplug;
+#[cfg(feature = "input")]
 mod input;
 
 use std::sync::Arc;
@@ -28,6 +30,8 @@ use crate::types::ResourceRegistry;
 
 #[cfg(feature = "drm")]
 pub use drm::DrmRegistry;
+#[cfg(feature = "input")]
+pub use input::InputIndex;
 
 /// The server's grant sources, cloned per client connection.
 #[derive(Clone)]
@@ -45,6 +49,10 @@ pub struct OpenedResources {
     pub registries: ResourceRegistries,
     /// Resources in advertised order (priority order — first is best).
     pub advertised: Vec<Resource>,
+    /// The input devices the server holds, so the hot-plug reconciler can tell
+    /// the node it opened apart from one re-created under the same path.
+    #[cfg(feature = "input")]
+    pub input_index: InputIndex,
 }
 
 /// Open and register every available resource.
@@ -59,6 +67,9 @@ pub fn query_resource() -> OpenedResources {
     #[allow(unused_mut)]
     let mut advertised = Vec::new();
 
+    #[cfg(feature = "input")]
+    let input_index = input::new_index();
+
     #[cfg(feature = "fbdev")]
     fbdev::open(resource_reg.clone(), &mut advertised);
 
@@ -69,7 +80,7 @@ pub fn query_resource() -> OpenedResources {
     drm::open_devices(drm_registry.clone(), &mut advertised);
 
     #[cfg(feature = "input")]
-    input::open_devices(resource_reg.clone(), &mut advertised);
+    input::open_devices(resource_reg.clone(), &mut advertised, &input_index);
 
     OpenedResources {
         registries: ResourceRegistries {
@@ -78,5 +89,7 @@ pub fn query_resource() -> OpenedResources {
             drm: drm_registry,
         },
         advertised,
+        #[cfg(feature = "input")]
+        input_index,
     }
 }

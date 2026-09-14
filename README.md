@@ -47,10 +47,18 @@ flowchart LR
 A build without a backend never advertises it, and `Acquire` against it is
 denied "not registered".
 
+Input is not a boot-time snapshot: the daemon re-checks `/dev/input` every
+couple of seconds, so a device plugged in while it runs is opened and advertised,
+and one that goes away is withdrawn (its holder is revoked). A device node that
+udev re-creates under it is re-opened for later grants without disturbing the
+client holding it. See [docs/resource-manager.md](docs/resource-manager.md).
+
 ## Limitations
 
-- **No input hot-plug** — devices are enumerated once at startup; restart
-  the daemon after attaching devices.
+- **A device that appears later reaches later clients only** — the advertised
+  list is sent once per connection, so an already-connected client is not told
+  about a device that appears after it connected (a device REMOVED while a
+  client holds it does reach it: the holder is revoked).
 
 ## Policies — `SGC_POLICY`
 

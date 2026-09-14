@@ -139,7 +139,7 @@ When a `Revoke` arrives:
 ## Windowing Backend Design
 - **DRM backend** (`--features drm`): creates fresh kernel lease fds per grant; the master fd never leaves the daemon; granted fd is a lease (holder can modeset on objects but never becomes DRM master); the server can revoke it at any time; kernel `revoke` runs at the handoff, so a revoked client keeps a valid lease through the grace window and can finish its frame
 - **Fbdev backend** (`--features fbdev`): uses `/dev/fb0`; grants are dups of the daemon's fd; legacy path; no kernel lease involved
-- **Input backend** (`--features input`): uses `/dev/input/event*`; grants are dups of the daemon's fd; devices enumerated once at startup; no hot-plug support
+- **Input backend** (`--features input`): uses `/dev/input/event*`; grants are dups of the daemon's fd; devices are enumerated at startup AND reconciled while the daemon runs (`resource_manager::hotplug`, 2 s): a device that appears is adopted and offered to the engine, one that goes away is withdrawn (holder revoked), and a node that udev re-creates for the same device is re-opened for future grants without disturbing its holder
 
 ## Windowing Engine Lifecycle
 1. **Build** — `PolicyEngine::spawn(policies)` starts one background task; no clients connected yet

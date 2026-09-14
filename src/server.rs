@@ -14,12 +14,13 @@ use std::{
 };
 
 use crate::{
-    client_handler::handle_connection, resource_manager::ResourceRegistries, types::ClientId,
+    client_handler::handle_connection,
+    resource_manager::ResourceRegistries,
+    types::{AdvertisedResources, ClientId},
     windowing::PolicyEngine,
 };
 use anyhow::Context;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use simple_graphics_protocol::Resource;
 use tokio::net::UnixListener;
 use tracing::{debug, error, info};
 
@@ -36,7 +37,7 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 pub async fn run(
     engine: PolicyEngine,
     registries: ResourceRegistries,
-    advertised: Arc<Vec<Resource>>,
+    advertised: Arc<AdvertisedResources>,
 ) -> anyhow::Result<()> {
     // Listen on the abstract namespace socket @sgc. Abstract sockets have
     // no filesystem path and vanish automatically when the server dies.

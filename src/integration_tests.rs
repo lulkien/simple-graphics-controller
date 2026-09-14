@@ -31,7 +31,7 @@ use tokio::{
 use crate::{
     client_handler::handle_connection,
     resource_manager::ResourceRegistries,
-    types::{ClientId, ResourceRegistry},
+    types::{AdvertisedResources, ClientId, ResourceRegistry},
     windowing::{Policy, PolicyEngine, REVOKE_TIMEOUT},
 };
 
@@ -174,7 +174,7 @@ async fn spawn_server(name: &'static [u8], policy: Policy) {
         #[cfg(feature = "drm")]
         drm: drm_registry,
     };
-    let advertised = Arc::new(vec![Resource::Fbdev]);
+    let advertised = Arc::new(AdvertisedResources::new(vec![Resource::Fbdev]));
 
     let engine = PolicyEngine::spawn(std::collections::HashMap::from([(Resource::Fbdev, policy)]));
 
