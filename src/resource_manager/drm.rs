@@ -294,9 +294,9 @@ fn lease_objects(card: &DrmCard) -> io::Result<Vec<RawResourceHandle>> {
 /// created per grant (see [`DrmDevice::grant_lease`]) and revoked when the
 /// client releases the resource, so the server can reclaim the card at any
 /// time — enforced by the kernel, no client cooperation needed.
-use super::Holdings;
+use super::Inventory;
 
-pub(super) fn open_devices(holdings: &Holdings, advertised: &mut Vec<Resource>) {
+pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>) {
     let entries = match read_dir("/dev/dri/") {
         Ok(entries) => entries,
         Err(e) => {
@@ -375,7 +375,7 @@ pub(super) fn open_devices(holdings: &Holdings, advertised: &mut Vec<Resource>) 
         let resource = Resource::Drm { card: opened.index };
         let fd = opened.card.as_raw_fd();
         info!("Opened {path} ({resource:?}) (master fd {fd})");
-        holdings.drm.insert(
+        inventory.drm.insert(
             resource.clone(),
             DrmDevice {
                 index: opened.index,

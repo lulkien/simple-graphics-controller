@@ -48,7 +48,7 @@ pub use input::InputIndex;
 /// input index move is what keeps them consistent. See
 /// `docs/resource-manager.md`, "The invariants between them".
 #[derive(Clone)]
-pub struct Holdings {
+pub struct Inventory {
     /// Static fds for `Fbdev` and `Input` (grants are dups of these).
     fds: ResourceRegistry,
     /// DRM lease factories: each grant creates a fresh lease fd.
@@ -59,10 +59,10 @@ pub struct Holdings {
     inputs: InputIndex,
 }
 
-impl Holdings {
+impl Inventory {
     /// The grant sources, with no input devices behind them. The daemon always
     /// goes through `open_resources()`; this is how a test builds a server's
-    /// holdings.
+    /// inventory.
     #[cfg(test)]
     #[cfg(feature = "drm")]
     pub(crate) fn new(fds: ResourceRegistry, drm: DrmRegistry) -> Self {
@@ -122,21 +122,12 @@ impl Holdings {
     }
 }
 
-/// What `open_resources()` produced: the devices the daemon holds, and the
-/// list it advertises in priority order (first is best).
-pub struct Inventory {
-    /// The devices the daemon holds and grants from.
-    pub holdings: Holdings,
-    /// Resources in advertised order (priority order — first is best).
-    pub advertised: Vec<Resource>,
-}
-
 /// Open and register every available resource.
 ///
-/// Returns the registries plus the resources in advertised order (priority
-/// order — first is best). Backends that are not compiled in contribute
-/// nothing.
-pub fn open_resources() -> Inventory {
+/// Returns the devices the daemon holds, plus the resources in advertised order
+/// (priority order — first is best). Backends that are not compiled in
+/// contribute nothing.
+pub fn open_resources() -> (Inventory, Vec<Resource>) {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     // With no backend features the list is never pushed to; the mut keeps
     // the body identical across all feature combinations.
@@ -148,7 +139,7 @@ pub fn open_resources() -> Inventory {
 
     // One value the backends register into, so no backend can hold a grant
     // source without the input index that goes with it.
-    let holdings = Holdings {
+    let inventory = Inventory {
         fds: resource_reg.clone(),
         #[cfg(feature = "drm")]
         drm: drm_registry,
@@ -157,31 +148,28 @@ pub fn open_resources() -> Inventory {
     };
 
     #[cfg(feature = "fbdev")]
-    fbdev::open(&holdings, &mut advertised);
+    fbdev::open(&inventory, &mut advertised);
 
     #[cfg(feature = "drm")]
-    drm::open_devices(&holdings, &mut advertised);
+    drm::open_devices(&inventory, &mut advertised);
 
     #[cfg(feature = "input")]
-    input::open_devices(&holdings, &mut advertised);
+    input::open_devices(&inventory, &mut advertised);
 
-    Inventory {
-        holdings,
-        advertised,
-    }
+    (inventory, advertised)
 }
 
 /// Check the invariants that tie the three structures together: one line per
 /// violation, empty when the state is coherent.
 ///
 /// These are the rules the module maintains by hand today, and the reason the
-/// transitions (suspend / resume / adopt) live behind `Holdings` methods: a
+/// transitions (suspend / resume / adopt) live behind `Inventory` methods: a
 /// violation means some path updated one structure without the others.
 ///
 /// 1. one index entry per resource, keyed by the devnode it sits on;
-/// 2. a LIVE entry (not suspended) is advertised, and its resource has an fd to
+/// 2. a LIVE entry (its device is there) is advertised, and its resource has an fd to
 ///    grant;
-/// 3. a SUSPENDED entry is neither advertised nor grantable — the holder keeps
+/// 3. a `device_gone` entry is neither advertised nor grantable — the holder keeps
 ///    the name, the daemon keeps no way to hand it out;
 /// 4. every advertised input has an index entry, and every input fd belongs to
 ///    an advertised resource (never a grant source without a device behind it).
@@ -210,16 +198,16 @@ pub fn check_consistency(
 
         let has_fd = fds.contains_key(&held.resource);
         let advertised = list.contains(&held.resource);
-        if held.suspended {
+        if held.device_gone {
             if has_fd {
                 problems.push(format!(
-                    "{:?} is suspended but still has an fd",
+                    "{:?} is marked device_gone but still has an fd",
                     held.resource
                 ));
             }
             if advertised {
                 problems.push(format!(
-                    "{:?} is suspended but still advertised",
+                    "{:?} is marked device_gone but still advertised",
                     held.resource
                 ));
             }
@@ -266,13 +254,13 @@ mod tests {
         std::fs::File::open("/dev/null").expect("/dev/null").into()
     }
 
-    fn entry(resource: &Resource, suspended: bool) -> HeldInput {
+    fn entry(resource: &Resource, device_gone: bool) -> HeldInput {
         HeldInput {
             resource: resource.clone(),
             dev: 1,
             ino: 2,
             device: None,
-            suspended,
+            device_gone,
         }
     }
 
@@ -285,7 +273,7 @@ mod tests {
     }
 
     /// Startup plus one device that went away while somebody held it: the
-    /// keyboard is live and advertised, the mouse is suspended and neither.
+    /// keyboard is live and advertised, the mouse's device is gone and it is neither.
     fn coherent() -> (ResourceRegistry, InputIndex, AdvertisedResources) {
         let fds: ResourceRegistry = Arc::new(DashMap::new());
         fds.insert(Resource::Fbdev, fd());
@@ -320,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_suspended_input_that_is_still_offered_is_reported() {
+    fn a_device_gone_input_that_is_still_offered_is_reported() {
         let (fds, index, advertised) = coherent();
         advertised.insert(mouse());
         fds.insert(mouse(), fd());
@@ -328,13 +316,13 @@ mod tests {
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("suspended but still advertised")),
+                .any(|p| p.contains("device_gone but still advertised")),
             "{problems:?}"
         );
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("suspended but still has an fd")),
+                .any(|p| p.contains("device_gone but still has an fd")),
             "{problems:?}"
         );
     }

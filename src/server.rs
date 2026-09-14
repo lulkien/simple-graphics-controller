@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     client_handler::handle_connection,
-    resource_manager::Holdings,
+    resource_manager::Inventory,
     types::{AdvertisedResources, ClientId},
     windowing::PolicyEngine,
 };
@@ -36,7 +36,7 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 /// loop ends (the listener broke).
 pub async fn run(
     engine: PolicyEngine,
-    holdings: Holdings,
+    inventory: Inventory,
     advertised: Arc<AdvertisedResources>,
 ) -> anyhow::Result<()> {
     // Listen on the abstract namespace socket @sgc. Abstract sockets have
@@ -70,7 +70,7 @@ pub async fn run(
                 );
 
                 let engine = engine.clone();
-                let holdings = holdings.clone();
+                let inventory = inventory.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
@@ -78,7 +78,7 @@ pub async fn run(
                         client_id,
                         client_pid,
                         engine.clone(),
-                        holdings,
+                        inventory,
                         advertised,
                     )
                     .await

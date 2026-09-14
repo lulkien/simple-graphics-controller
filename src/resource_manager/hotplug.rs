@@ -49,7 +49,7 @@ use tracing::{debug, error, info, warn};
 
 use super::input::{self, HeldInput, InputClass, InputIndex};
 use crate::{
-    resource_manager::Holdings,
+    resource_manager::Inventory,
     types::AdvertisedResources,
     windowing::{ControlMessage, Policy, PolicyEngine},
 };
@@ -87,7 +87,7 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 /// ends. `policy` is the server's windowing policy (`SGC_POLICY`), applied to
 /// every device adopted later exactly as it was to the ones opened at startup.
 pub async fn run(
-    holdings: Holdings,
+    inventory: Inventory,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
@@ -100,21 +100,21 @@ pub async fn run(
             info!(
                 "Watching {WATCH_DIR} for device changes (safety pass every {SAFETY_INTERVAL:?})"
             );
-            run_watched(holdings, advertised, engine, policy, watch).await;
+            run_watched(inventory, advertised, engine, policy, watch).await;
         }
         Err(e) => {
             warn!(
                 "Cannot watch {WATCH_DIR} ({e}); polling every {FALLBACK_INTERVAL:?} instead \
                  (a device that appears will still be adopted)"
             );
-            run_polling(holdings, advertised, engine, policy).await;
+            run_polling(inventory, advertised, engine, policy).await;
         }
     }
 }
 
 /// Event-driven: reconcile when `/dev/input` changes, plus the backstop pass.
 async fn run_watched(
-    holdings: Holdings,
+    inventory: Inventory,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
@@ -131,7 +131,7 @@ async fn run_watched(
                     warn!(
                         "Input watch failed ({e}); polling every {FALLBACK_INTERVAL:?} from now on"
                     );
-                    return run_polling(holdings, advertised, engine, policy).await;
+                    return run_polling(inventory, advertised, engine, policy).await;
                 }
                 "device change"
             }
@@ -141,7 +141,7 @@ async fn run_watched(
 
         let mut attempt = 0;
         loop {
-            let retry = reconcile(&holdings, &advertised, &engine, policy).await;
+            let retry = reconcile(&inventory, &advertised, &engine, policy).await;
             attempt += 1;
             if !retry || attempt >= MAX_RETRIES {
                 if retry {
@@ -159,14 +159,14 @@ async fn run_watched(
 
 /// The fallback: the same pass on a timer, used when there is nothing to watch.
 async fn run_polling(
-    holdings: Holdings,
+    inventory: Inventory,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
 ) {
     loop {
         tokio::time::sleep(FALLBACK_INTERVAL).await;
-        reconcile(&holdings, &advertised, &engine, policy).await;
+        reconcile(&inventory, &advertised, &engine, policy).await;
     }
 }
 
@@ -231,7 +231,7 @@ impl Watch {
 /// (udev is still setting it up): the caller retries shortly, because with an
 /// event-driven wake there may be no next pass for a while.
 async fn reconcile(
-    holdings: &Holdings,
+    inventory: &Inventory,
     advertised: &AdvertisedResources,
     engine: &PolicyEngine,
     policy: Policy,
@@ -243,7 +243,7 @@ async fn reconcile(
     for device in probed {
         present.push(device.path.clone());
         let current = input::path_identity(&device.path);
-        let held = holdings
+        let held = inventory
             .inputs
             .get(&device.path)
             .map(|entry| entry.value().clone());
@@ -255,8 +255,8 @@ async fn reconcile(
             // The device is back at the node it had: its holder kept the
             // resource while it was away, so it gets a fresh fd for this device
             // — provided it IS that device's class (see `may_resume`).
-            Some(held) if held.suspended && may_resume(&held, device.class) => {
-                if !holdings
+            Some(held) if held.device_gone && may_resume(&held, device.class) => {
+                if !inventory
                     .resume(
                         advertised,
                         engine,
@@ -274,7 +274,7 @@ async fn reconcile(
             // A device of another class took the node over. The suspended claim
             // keeps its name and waits for its own device, and the newcomer is a
             // new resource — never the name of a class it is not.
-            Some(held) if held.suspended => {
+            Some(held) if held.device_gone => {
                 info!(
                     "{} ({}) is a {:?}, not the device {:?} waits for: the claim keeps its name and this device is adopted",
                     device.path.display(),
@@ -282,8 +282,8 @@ async fn reconcile(
                     device.class,
                     held.resource
                 );
-                park(&holdings.inputs, &device.path);
-                if !holdings
+                park(&inventory.inputs, &device.path);
+                if !inventory
                     .adopt(
                         advertised,
                         engine,
@@ -306,7 +306,7 @@ async fn reconcile(
             // resolves to "eventN (deleted)", which the next client's libinput
             // refuses.
             Some(held) if same_device(&device.path, &held) => {
-                if !holdings.reopen(&device.path, &held.resource) {
+                if !inventory.reopen(&device.path, &held.resource) {
                     retry = true;
                 }
             }
@@ -327,9 +327,9 @@ async fn reconcile(
                     );
                 }
                 let taken = if replaced {
-                    holdings.reopen(&device.path, &held.resource)
+                    inventory.reopen(&device.path, &held.resource)
                 } else if may_resume(&held, device.class) {
-                    holdings
+                    inventory
                         .resume(
                             advertised,
                             engine,
@@ -343,11 +343,11 @@ async fn reconcile(
                     // Another class took the node and the device this resource
                     // held is gone: suspend it (its holder keeps the name, off
                     // the node) and register the newcomer as a new resource.
-                    holdings
+                    inventory
                         .suspend(advertised, engine, &device.path, &held)
                         .await;
-                    park(&holdings.inputs, &device.path);
-                    holdings
+                    park(&inventory.inputs, &device.path);
+                    inventory
                         .adopt(
                             advertised,
                             engine,
@@ -367,7 +367,7 @@ async fn reconcile(
             // waiting for. A device that comes back on a DIFFERENT node (a replug
             // into another port) still belongs to the client that held that name:
             // it asked for "the mouse", not for a specific devnode.
-            None => match suspended_peer(&holdings.inputs, device.class) {
+            None => match suspended_peer(&inventory.inputs, device.class) {
                 Some((old_path, held)) => {
                     info!(
                         "{} ({}) takes over {:?} from {}: the device is back on another node",
@@ -376,7 +376,7 @@ async fn reconcile(
                         held.resource,
                         old_path.display()
                     );
-                    if !holdings
+                    if !inventory
                         .resume(
                             advertised,
                             engine,
@@ -391,7 +391,7 @@ async fn reconcile(
                     }
                 }
                 None => {
-                    if !holdings
+                    if !inventory
                         .adopt(
                             advertised,
                             engine,
@@ -410,13 +410,13 @@ async fn reconcile(
     }
 
     // Held devices whose node is not in `/dev/input` this pass.
-    let held: Vec<(PathBuf, HeldInput)> = holdings
+    let held: Vec<(PathBuf, HeldInput)> = inventory
         .inputs
         .iter()
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
     for (path, held) in held {
-        if held.suspended || present.contains(&path) {
+        if held.device_gone || present.contains(&path) {
             continue;
         }
         // The node is absent, but is the DEVICE still there? A node that is
@@ -426,14 +426,14 @@ async fn reconcile(
         if held.device.as_ref().is_some_and(|device| device.exists()) {
             continue;
         }
-        holdings.suspend(advertised, engine, &path, &held).await;
+        inventory.suspend(advertised, engine, &path, &held).await;
     }
 
     // The invariants this module maintains by hand, checked where they can
     // break. Debug builds only: a violation is a bug in the code above, not
     // something to take a board down over.
     #[cfg(debug_assertions)]
-    for problem in super::check_consistency(&holdings.fds, &holdings.inputs, advertised) {
+    for problem in super::check_consistency(&inventory.fds, &inventory.inputs, advertised) {
         error!("resource invariant violated: {problem}");
     }
 
@@ -450,7 +450,7 @@ fn same_device(path: &Path, held: &HeldInput) -> bool {
     }
 }
 
-impl Holdings {
+impl Inventory {
     /// Replace the server's fd for a device whose node was re-created: the resource
     /// keeps its name, its holder keeps the fd it has (it still works), and the NEXT
     /// grant opens the node as it exists now. `false` if the node would not open yet.
@@ -467,7 +467,7 @@ impl Holdings {
                 dev,
                 ino,
                 device: input::device_identity(path),
-                suspended: false,
+                device_gone: false,
             },
         );
         info!(
@@ -514,7 +514,7 @@ impl Holdings {
                 dev,
                 ino,
                 device: input::device_identity(path),
-                suspended: false,
+                device_gone: false,
             },
         );
         advertised.insert(resource.clone());
@@ -547,7 +547,7 @@ impl Holdings {
         self.inputs.insert(
             path.to_path_buf(),
             HeldInput {
-                suspended: true,
+                device_gone: true,
                 ..held.clone()
             },
         );
@@ -592,7 +592,7 @@ impl Holdings {
                 dev,
                 ino,
                 device: input::device_identity(path),
-                suspended: false,
+                device_gone: false,
             },
         );
         advertised.insert(resource.clone());
@@ -657,7 +657,7 @@ fn free_index(index: &InputIndex, class: InputClass) -> Option<u8> {
 fn suspended_peer(index: &InputIndex, class: InputClass) -> Option<(PathBuf, HeldInput)> {
     let mut candidates: Vec<(PathBuf, HeldInput)> = index
         .iter()
-        .filter(|entry| entry.value().suspended)
+        .filter(|entry| entry.value().device_gone)
         .filter(|entry| InputClass::of_resource(&entry.value().resource) == Some(class))
         .filter(|entry| !entry.key().exists())
         .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -687,7 +687,7 @@ mod tests {
         hold_as(index, resource, path, false);
     }
 
-    fn hold_as(index: &InputIndex, resource: Resource, path: &str, suspended: bool) {
+    fn hold_as(index: &InputIndex, resource: Resource, path: &str, device_gone: bool) {
         index.insert(
             PathBuf::from(path),
             HeldInput {
@@ -695,7 +695,7 @@ mod tests {
                 dev: 0,
                 ino: 0,
                 device: None,
-                suspended,
+                device_gone,
             },
         );
     }

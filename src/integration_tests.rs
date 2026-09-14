@@ -30,7 +30,7 @@ use tokio::{
 
 use crate::{
     client_handler::handle_connection,
-    resource_manager::Holdings,
+    resource_manager::Inventory,
     types::{AdvertisedResources, ClientId, ResourceRegistry},
     windowing::{ControlMessage, Policy, PolicyEngine, REVOKE_TIMEOUT},
 };
@@ -191,9 +191,9 @@ async fn spawn_server(
     let drm_registry = Arc::new(DashMap::new());
     // No DRM cards on test hosts; the lease registry stays empty.
     #[cfg(feature = "drm")]
-    let holdings = Holdings::new(resource_reg, drm_registry);
+    let inventory = Inventory::new(resource_reg, drm_registry);
     #[cfg(not(feature = "drm"))]
-    let holdings = Holdings::new(resource_reg);
+    let inventory = Inventory::new(resource_reg);
     let advertised = Arc::new(AdvertisedResources::new(vec![Resource::Fbdev]));
 
     let engine = PolicyEngine::spawn(std::collections::HashMap::from([(Resource::Fbdev, policy)]));
@@ -217,12 +217,18 @@ async fn spawn_server(
             let creds = getsockopt(&stream, PeerCredentials).expect("peer credentials");
             let client_id = ClientId::new(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
             let engine = accept_engine.clone();
-            let holdings = holdings.clone();
+            let inventory = inventory.clone();
             let advertised = accept_advertised.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(stream, client_id, creds.pid(), engine, holdings, advertised)
-                        .await
+                if let Err(e) = handle_connection(
+                    stream,
+                    client_id,
+                    creds.pid(),
+                    engine,
+                    inventory,
+                    advertised,
+                )
+                .await
                 {
                     eprintln!("handler error: {e:#}");
                 }

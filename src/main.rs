@@ -35,10 +35,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting simple-graphics-controller");
-    let inventory = open_resources();
+    let (inventory, advertised) = open_resources();
     // Advertised list: shared and mutable, because the input reconciler adds
     // and drops resources as devices come and go.
-    let advertised = Arc::new(AdvertisedResources::new(inventory.advertised));
+    let advertised = Arc::new(AdvertisedResources::new(advertised));
     debug!(
         "Advertised resources (priority order): {:?}",
         advertised.snapshot()
@@ -67,13 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // adopted later are offered to the engine with the same policy.
     #[cfg(feature = "input")]
     tokio::spawn(hotplug::run(
-        inventory.holdings.clone(),
+        inventory.clone(),
         advertised.clone(),
         engine.clone(),
         policy,
     ));
 
-    // The holdings (with the DRM masters inside them) stay alive for the whole
+    // The inventory (with the DRM masters inside it) stays alive for the whole
     // run: closing a master destroys its leases.
-    server::run(engine, inventory.holdings, advertised).await
+    server::run(engine, inventory, advertised).await
 }
