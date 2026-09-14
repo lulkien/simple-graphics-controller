@@ -21,12 +21,14 @@ pub mod hotplug;
 #[cfg(feature = "input")]
 mod input;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
 
-use crate::types::ResourceRegistry;
+use crate::types::{AdvertisedResources, ResourceRegistry};
 
 #[cfg(feature = "drm")]
 pub use drm::DrmRegistry;
@@ -92,5 +94,174 @@ pub fn open_resources() -> Inventory {
         advertised,
         #[cfg(feature = "input")]
         input_index,
+    }
+}
+
+/// Check the invariants that tie the three structures together: one line per
+/// violation, empty when the state is coherent.
+///
+/// These are the rules the module maintains by hand today, and the reason the
+/// transitions (suspend / resume / adopt) belong behind methods: a violation
+/// means some path updated one structure without the others.
+///
+/// 1. one index entry per resource, keyed by the devnode it sits on;
+/// 2. a LIVE entry (not suspended) is advertised, and its resource has an fd to
+///    grant;
+/// 3. a SUSPENDED entry is neither advertised nor grantable — the holder keeps
+///    the name, the daemon keeps no way to hand it out;
+/// 4. every advertised input has an index entry, and every input fd belongs to
+///    an advertised resource (never a grant source without a device behind it).
+#[cfg(feature = "input")]
+pub fn check_consistency(
+    fds: &ResourceRegistry,
+    index: &InputIndex,
+    advertised: &AdvertisedResources,
+) -> Vec<String> {
+    let list = advertised.snapshot();
+    let mut problems = Vec::new();
+    let mut seen: HashMap<Resource, PathBuf> = HashMap::new();
+
+    for entry in index.iter() {
+        let path = entry.key().clone();
+        let held = entry.value();
+
+        if let Some(previous) = seen.insert(held.resource.clone(), path.clone()) {
+            problems.push(format!(
+                "{:?} is in the index twice: {} and {}",
+                held.resource,
+                previous.display(),
+                path.display()
+            ));
+        }
+
+        let has_fd = fds.contains_key(&held.resource);
+        let advertised = list.contains(&held.resource);
+        if held.suspended {
+            if has_fd {
+                problems.push(format!(
+                    "{:?} is suspended but still has an fd",
+                    held.resource
+                ));
+            }
+            if advertised {
+                problems.push(format!(
+                    "{:?} is suspended but still advertised",
+                    held.resource
+                ));
+            }
+        } else {
+            if !has_fd {
+                problems.push(format!(
+                    "{:?} ({}) is live but has no fd",
+                    held.resource,
+                    path.display()
+                ));
+            }
+            if !advertised {
+                problems.push(format!(
+                    "{:?} ({}) is live but not advertised",
+                    held.resource,
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    for resource in &list {
+        if matches!(resource, Resource::Input(_)) && !seen.contains_key(resource) {
+            problems.push(format!("{resource:?} is advertised with no index entry"));
+        }
+    }
+
+    for entry in fds.iter() {
+        if matches!(entry.key(), Resource::Input(_)) && !list.contains(entry.key()) {
+            problems.push(format!("{:?} has an fd but is not advertised", entry.key()));
+        }
+    }
+
+    problems
+}
+
+#[cfg(all(test, feature = "input"))]
+mod tests {
+    use super::*;
+    use crate::resource_manager::input::{HeldInput, new_index};
+    use simple_graphics_protocol::InputResource;
+
+    fn fd() -> std::os::fd::OwnedFd {
+        std::fs::File::open("/dev/null").expect("/dev/null").into()
+    }
+
+    fn entry(resource: &Resource, suspended: bool) -> HeldInput {
+        HeldInput {
+            resource: resource.clone(),
+            dev: 1,
+            ino: 2,
+            device: None,
+            suspended,
+        }
+    }
+
+    fn keyboard() -> Resource {
+        Resource::Input(InputResource::Keyboard(0))
+    }
+
+    fn mouse() -> Resource {
+        Resource::Input(InputResource::Mouse(0))
+    }
+
+    /// Startup plus one device that went away while somebody held it: the
+    /// keyboard is live and advertised, the mouse is suspended and neither.
+    fn coherent() -> (ResourceRegistry, InputIndex, AdvertisedResources) {
+        let fds: ResourceRegistry = Arc::new(DashMap::new());
+        fds.insert(Resource::Fbdev, fd());
+        fds.insert(keyboard(), fd());
+
+        let index = new_index();
+        index.insert("/dev/input/event0".into(), entry(&keyboard(), false));
+        index.insert("/dev/input/event6".into(), entry(&mouse(), true));
+
+        let advertised = AdvertisedResources::new(vec![Resource::Fbdev, keyboard()]);
+        (fds, index, advertised)
+    }
+
+    #[test]
+    fn a_coherent_state_reports_nothing() {
+        let (fds, index, advertised) = coherent();
+        assert_eq!(
+            check_consistency(&fds, &index, &advertised),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_live_input_without_a_grant_source_is_reported() {
+        let (fds, index, advertised) = coherent();
+        fds.remove(&keyboard());
+        let problems = check_consistency(&fds, &index, &advertised);
+        assert!(
+            problems.iter().any(|p| p.contains("live but has no fd")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_suspended_input_that_is_still_offered_is_reported() {
+        let (fds, index, advertised) = coherent();
+        advertised.insert(mouse());
+        fds.insert(mouse(), fd());
+        let problems = check_consistency(&fds, &index, &advertised);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("suspended but still advertised")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("suspended but still has an fd")),
+            "{problems:?}"
+        );
     }
 }
