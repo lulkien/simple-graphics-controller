@@ -23,7 +23,7 @@ use super::policy::{AcquireDecision, Policy, SlotState};
 /// the resource free (the owner is NOT requeued in that case).
 pub const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Messages the engine pushes to a connection task (which owns the stream).
+/// Messages the server pushes to a connection task (which owns the stream).
 #[derive(Debug, Clone)]
 pub enum ControlMessage {
     /// Evict the client: write `ServerMessage::Revoke` on the wire.
@@ -31,6 +31,11 @@ pub enum ControlMessage {
     /// The client is granted (after being queued or requeued): write
     /// `ServerMessage::Grant` with the matching fd on the wire.
     Grant { resource: Resource },
+    /// The server's resource list changed (a device appeared or went away):
+    /// write `ServerMessage::Advertise` with the current list. Server-level
+    /// state rather than ownership, routed through the engine because the
+    /// engine is what knows every connected client.
+    Advertise { available_resources: Vec<Resource> },
 }
 
 /// Outcome of an `Acquire` request.
@@ -48,6 +53,11 @@ pub enum AcquireOutcome {
 #[derive(Debug, Clone, Copy)]
 struct Waiter {
     client: ClientId,
+    /// Waiting as the app on the DISPLAY, taking a device from a client that has
+    /// none. Such a claim is served before any other waiter and regardless of
+    /// policy — `first-owner` never serves waiters, but it has to serve this one,
+    /// or the app on screen would never get its device back.
+    seat_claim: bool,
 }
 
 /// Per-resource slot: owner, waiters, and revoke bookkeeping.
@@ -57,10 +67,11 @@ struct Slot {
     waiters: VecDeque<Waiter>,
     /// Set while a Revoke is in flight (awaiting the owner's Release).
     revoke_deadline: Option<Instant>,
-    /// Set when the resource leaves the server (its device is gone): no new
-    /// grants, no queue, and the slot itself is removed as soon as nobody
-    /// holds it.
-    withdrawn: bool,
+    /// Set while the device behind this resource is absent (unplugged, gone
+    /// from `/dev`): the owner KEEPS the resource — no revoke — and is handed a
+    /// fresh fd when the device comes back. Nothing else can take it in the
+    /// meantime.
+    suspended: bool,
 }
 
 impl Slot {
@@ -77,6 +88,13 @@ impl Slot {
         self.waiters.iter().any(|w| w.client == client)
     }
 
+    /// Take the seat's claim out of the queue, if it has one: the app on the
+    /// display is served before anyone else, whatever the policy's order is.
+    fn pop_seat_claim(&mut self) -> Option<Waiter> {
+        let index = self.waiters.iter().position(|w| w.seat_claim)?;
+        self.waiters.remove(index)
+    }
+
     fn pop_waiter(&mut self) -> Option<Waiter> {
         self.policy.pop_waiter(&mut self.waiters)
     }
@@ -84,6 +102,15 @@ impl Slot {
 
 /// Commands from connection tasks to the engine.
 enum EngineCommand {
+    /// The device behind `resource` is gone. Its holder keeps the resource (no
+    /// revoke, no re-acquire when it returns).
+    Suspend {
+        resource: Resource,
+    },
+    /// The device behind `resource` is back: hand the holder a fresh fd.
+    Resume {
+        resource: Resource,
+    },
     Register {
         client: ClientId,
         control: mpsc::UnboundedSender<ControlMessage>,
@@ -106,11 +133,9 @@ enum EngineCommand {
         resource: Resource,
         policy: Policy,
     },
-    /// A resource is gone (its device was removed or re-created): revoke the
-    /// holder if any, refuse further Acquires, and drop the slot once nobody
-    /// holds it.
-    Withdraw {
-        resource: Resource,
+    /// Push a message to every connected client (the resource list changed).
+    Broadcast {
+        message: ControlMessage,
     },
 }
 
@@ -177,11 +202,26 @@ impl PolicyEngine {
             .await;
     }
 
-    /// Stop offering `resource`: revoke its holder if it has one, refuse
-    /// further Acquires, and forget the slot once it is free. Used when the
-    /// device behind it goes away.
-    pub async fn withdraw(&self, resource: Resource) {
-        let _ = self.tx.send(EngineCommand::Withdraw { resource }).await;
+    /// The device behind `resource` is gone: whoever holds it keeps it and is
+    /// handed a fresh fd when it comes back (`resume`). No revoke: for a
+    /// keyboard or a mouse that was unplugged, "you lost your device" is the
+    /// wrong answer — the device is coming back.
+    pub async fn suspend(&self, resource: Resource) {
+        let _ = self.tx.send(EngineCommand::Suspend { resource }).await;
+    }
+
+    /// The device behind `resource` is back. A holder is re-granted the same
+    /// resource with a fresh fd — it never lost it, so it has nothing to
+    /// re-acquire.
+    pub async fn resume(&self, resource: Resource) {
+        let _ = self.tx.send(EngineCommand::Resume { resource }).await;
+    }
+
+    /// Send `message` to every registered client. Connections that have gone
+    /// away are skipped: their task is cleaning up, and a failed send to a
+    /// dead channel is not a server error.
+    pub async fn broadcast(&self, message: ControlMessage) {
+        let _ = self.tx.send(EngineCommand::Broadcast { message }).await;
     }
 }
 
@@ -196,7 +236,7 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
                     owner: None,
                     waiters: VecDeque::new(),
                     revoke_deadline: None,
-                    withdrawn: false,
+                    suspended: false,
                 },
             )
         })
@@ -216,7 +256,7 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
             Ok(None) => break, // all connection tasks gone; engine shuts down
             Err(_) => {
                 // Revoke deadline(s) elapsed: force-reclaim silent owners.
-                let mut forced: Vec<Resource> = Vec::new();
+                let mut ex_seats: Vec<ClientId> = Vec::new();
                 for (resource, slot) in slots.iter_mut() {
                     if let Some(deadline) = slot.revoke_deadline
                         && deadline <= Instant::now()
@@ -226,17 +266,71 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
                                  Release after Revoke",
                             slot.owner.map(|o| o.to_string()).unwrap_or_default()
                         );
+                        // A display taken away ends that client's seat, and the
+                        // seat's inputs go with it.
+                        if is_display(resource)
+                            && let Some(ex_seat) = slot.owner
+                        {
+                            ex_seats.push(ex_seat);
+                        }
                         force_reclaim(resource, slot, &control_reg);
-                        forced.push(resource.clone());
                     }
                 }
-                // A withdrawn resource whose owner just got reclaimed is done
-                // with too.
-                for resource in &forced {
-                    drop_withdrawn(resource, &mut slots);
+                for ex_seat in ex_seats {
+                    release_seat_inputs(ex_seat, &mut slots, &control_reg);
                 }
             }
         }
+    }
+}
+
+/// Is this a display resource — something the app on screen holds? A DRM card
+/// lease or the framebuffer: whoever owns one of these IS the seat, and there is
+/// exactly one seat (the daemon does not support several displays).
+fn is_display(resource: &Resource) -> bool {
+    matches!(resource, Resource::Drm { .. } | Resource::Fbdev)
+}
+
+/// Does `client` hold the display? Input belongs to the app on screen (see
+/// [`acquire_one`]), so this is the test for whether a client may hold a device
+/// at all.
+fn holds_display(slots: &HashMap<Resource, Slot>, client: ClientId) -> bool {
+    slots
+        .iter()
+        .any(|(resource, slot)| is_display(resource) && slot.owner == Some(client))
+}
+
+/// The seat changed hands or was vacated: whoever sat in it must not keep input
+/// nobody can see. Ask every input the former seat holds for a Release (the same
+/// handshake as a preemption — the device frees when it answers, and a waiter is
+/// served normally).
+fn release_seat_inputs(
+    ex_seat: ClientId,
+    slots: &mut HashMap<Resource, Slot>,
+    control_reg: &HashMap<ClientId, mpsc::UnboundedSender<ControlMessage>>,
+) {
+    let held: Vec<Resource> = slots
+        .iter()
+        .filter(|(resource, slot)| {
+            matches!(resource, Resource::Input(_)) && slot.owner == Some(ex_seat)
+        })
+        .map(|(resource, _)| resource.clone())
+        .collect();
+
+    for resource in held {
+        let Some(control) = control_reg.get(&ex_seat) else {
+            // The connection is already gone; its Disconnected handling frees
+            // whatever it owned.
+            continue;
+        };
+        let Some(slot) = slots.get_mut(&resource) else {
+            continue;
+        };
+        let _ = control.send(ControlMessage::Revoke {
+            resource: resource.clone(),
+        });
+        slot.revoke_deadline = Some(Instant::now() + REVOKE_TIMEOUT);
+        info!("[client {ex_seat}] left the seat; revoking {resource:?} with it");
     }
 }
 
@@ -248,17 +342,17 @@ fn acquire_one(
     slots: &mut HashMap<Resource, Slot>,
     control_reg: &mut HashMap<ClientId, mpsc::UnboundedSender<ControlMessage>>,
 ) -> AcquireOutcome {
+    // Precomputed: the checks below need the slot mutably, and "who is the app
+    // on screen" does not depend on the slot being asked for.
+    let requester_is_seat = holds_display(slots, client);
+    let holder = slots.get(&resource).and_then(|slot| slot.owner);
+    let holder_is_seat = holder.is_some_and(|owner| holds_display(slots, owner));
+
     let Some(slot) = slots.get_mut(&resource) else {
         return AcquireOutcome::Denied {
             reason: format!("{resource:?} is not registered"),
         };
     };
-
-    if slot.withdrawn {
-        return AcquireOutcome::Denied {
-            reason: format!("{resource:?} is no longer available (its device is gone)"),
-        };
-    }
 
     if slot.owner == Some(client) {
         return AcquireOutcome::Denied {
@@ -266,7 +360,54 @@ fn acquire_one(
         };
     }
 
-    match slot.policy.decide(slot.state()) {
+    // The device is absent: the resource is out of the advertised list while it
+    // is away, and its holder keeps it — there is nothing to take here, and
+    // nothing to steal.
+    if slot.suspended {
+        return AcquireOutcome::Denied {
+            reason: format!(
+                "{resource:?} is not available while its device is away — its holder keeps it"
+            ),
+        };
+    }
+
+    // Input is owned by CLASS: the app on the display takes a device from a
+    // client that has none, and a client with no display never takes one from
+    // anybody. It may still hold a device nobody wants (free), but it never
+    // queues for one: a low-priority waiter would be served ahead of the app on
+    // screen the moment the device freed, and the app on screen would wait
+    // behind a background client.
+    if matches!(resource, Resource::Input(_))
+        && !requester_is_seat
+        && let Some(owner) = holder
+    {
+        let reason = format!(
+            "{resource:?} is held by client {owner} — only the app on the display can take it"
+        );
+        warn!("[client {client}] denied {resource:?}: {reason}");
+        return AcquireOutcome::Denied { reason };
+    }
+
+    // The seat's claim outranks a holder that is not on the display: it takes
+    // the device whatever the policy says — `first-owner` does not protect a
+    // background holder from the app on screen.
+    let seat_steal = matches!(resource, Resource::Input(_))
+        && requester_is_seat
+        && holder.is_some()
+        && !holder_is_seat;
+    if seat_steal {
+        info!(
+            "[client {client}] takes {resource:?} from client {} — the app on the display outranks it",
+            holder.map(|o| o.to_string()).unwrap_or_default()
+        );
+    }
+    let decision = if seat_steal {
+        AcquireDecision::RevokeAndQueue
+    } else {
+        slot.policy.decide(slot.state())
+    };
+
+    match decision {
         AcquireDecision::Grant => {
             slot.owner = Some(client);
             info!("[client {client}] acquired {resource:?}");
@@ -285,7 +426,10 @@ fn acquire_one(
                 debug!("[client {client}] already queued for {resource:?}; keeping position");
                 return AcquireOutcome::Queued;
             }
-            slot.waiters.push_back(Waiter { client });
+            slot.waiters.push_back(Waiter {
+                client,
+                seat_claim: seat_steal,
+            });
             debug!(
                 "[client {client}] queued for {resource:?} ({} waiting)",
                 slot.waiters.len()
@@ -337,9 +481,15 @@ fn release_one(
     slot.owner = None;
     slot.revoke_deadline = None;
     if revoking && !slot.waiters.is_empty() {
-        // Clean revoke-ack: the preempted owner gets one more turn.
-        slot.policy
-            .requeue_waiter(&mut slot.waiters, Waiter { client });
+        // Clean revoke-ack: the preempted owner gets one more turn (not as a
+        // seat claim — it is not the app on screen).
+        slot.policy.requeue_waiter(
+            &mut slot.waiters,
+            Waiter {
+                client,
+                seat_claim: false,
+            },
+        );
         info!("[client {client}] released {resource:?} after Revoke; requeued");
     } else {
         // Spontaneous release, or the revoke's preemptor(s) are gone:
@@ -348,19 +498,6 @@ fn release_one(
         info!("[client {client}] released {resource:?}");
     }
     grant_next(resource, slot, control_reg);
-}
-
-/// Forget a withdrawn slot once nobody holds it: the device behind the
-/// resource is gone, and the slot must not survive to be silently revived by a
-/// later `Offer` of the same resource name.
-fn drop_withdrawn(resource: &Resource, slots: &mut HashMap<Resource, Slot>) {
-    if slots
-        .get(resource)
-        .is_some_and(|slot| slot.withdrawn && slot.owner.is_none())
-    {
-        slots.remove(resource);
-        debug!("{resource:?} is withdrawn and free: slot removed");
-    }
 }
 
 fn handle_command(
@@ -375,7 +512,6 @@ fn handle_command(
         }
         EngineCommand::Disconnected { client } => {
             control_reg.remove(&client);
-            let mut released: Vec<Resource> = Vec::new();
             for (resource, slot) in slots.iter_mut() {
                 let before = slot.waiters.len();
                 slot.waiters.retain(|w| w.client != client);
@@ -387,12 +523,7 @@ fn handle_command(
                     slot.owner = None;
                     slot.revoke_deadline = None;
                     grant_next(resource, slot, control_reg);
-                    released.push(resource.clone());
                 }
-            }
-            // A withdrawn resource whose owner just left is done with.
-            for resource in &released {
-                drop_withdrawn(resource, slots);
             }
         }
         EngineCommand::Acquire {
@@ -404,8 +535,70 @@ fn handle_command(
             let _ = reply.send(outcome);
         }
         EngineCommand::Release { client, resource } => {
+            // Releasing the display is leaving the seat, and the seat's inputs
+            // go with it (computed before the release, while the client still
+            // owns the slot).
+            let left_seat = is_display(&resource)
+                && slots.get(&resource).and_then(|slot| slot.owner) == Some(client);
             release_one(client, &resource, slots, control_reg);
-            drop_withdrawn(&resource, slots);
+            if left_seat {
+                release_seat_inputs(client, slots, control_reg);
+            }
+        }
+        EngineCommand::Broadcast { message } => {
+            let text = format!("{message:?}");
+            let mut delivered = 0usize;
+            for control in control_reg.values() {
+                if control.send(message.clone()).is_ok() {
+                    delivered += 1;
+                }
+            }
+            debug!("Pushed to {delivered} client(s): {text}");
+        }
+        EngineCommand::Suspend { resource } => {
+            let Some(slot) = slots.get_mut(&resource) else {
+                debug!("Suspend of unregistered {resource:?} ignored");
+                return;
+            };
+            slot.suspended = true;
+            // Nothing can be handed over while the device is away: drop a
+            // revoke that was in flight, or its deadline would reclaim a
+            // resource nobody could use.
+            slot.revoke_deadline = None;
+            match slot.owner {
+                Some(owner) => info!(
+                    "Suspended {resource:?}: client {owner} keeps it until the device is back"
+                ),
+                None => info!("Suspended {resource:?}: it is unavailable while its device is away"),
+            }
+        }
+        EngineCommand::Resume { resource } => {
+            let Some(slot) = slots.get_mut(&resource) else {
+                debug!("Resume of unregistered {resource:?} ignored");
+                return;
+            };
+            if !slot.suspended {
+                debug!("Resume of {resource:?} that was not suspended; ignored");
+                return;
+            }
+            slot.suspended = false;
+            match slot.owner {
+                // The holder never lost the resource: same client, same name, a
+                // fresh fd for the device that came back.
+                Some(owner) => match control_reg.get(&owner) {
+                    Some(control) => {
+                        info!("Re-granting {resource:?} to client {owner}: the device is back");
+                        let _ = control.send(ControlMessage::Grant {
+                            resource: resource.clone(),
+                        });
+                    }
+                    None => {
+                        slot.owner = None;
+                        warn!("{resource:?} came back but client {owner} is gone; it stays free");
+                    }
+                },
+                None => info!("{resource:?} is back and free"),
+            }
         }
         EngineCommand::Offer { resource, policy } => {
             // Idempotent: a re-created device node keeps its slot (and with it
@@ -421,45 +614,10 @@ fn handle_command(
                     owner: None,
                     waiters: VecDeque::new(),
                     revoke_deadline: None,
-                    withdrawn: false,
+                    suspended: false,
                 },
             );
             info!("Offering {resource:?} ({policy:?})");
-        }
-        EngineCommand::Withdraw { resource } => {
-            let Some(slot) = slots.get_mut(&resource) else {
-                debug!("Withdraw of unregistered {resource:?} ignored");
-                return;
-            };
-            slot.withdrawn = true;
-            // The device is gone: a queued Grant can never be honoured, and the
-            // protocol has no async "cancelled" reply, so drop the queue (the
-            // waiters were already answered `Queued` and will simply never hear
-            // back).
-            let queued = slot.waiters.len();
-            slot.waiters.clear();
-            match slot.owner {
-                Some(owner) => {
-                    // Same handshake as a preemption: ask, then force.
-                    if let Some(control) = control_reg.get(&owner) {
-                        let _ = control.send(ControlMessage::Revoke {
-                            resource: resource.clone(),
-                        });
-                        slot.revoke_deadline = Some(Instant::now() + REVOKE_TIMEOUT);
-                    } else {
-                        slot.owner = None;
-                        slot.revoke_deadline = None;
-                    }
-                    warn!(
-                        "Withdrawing {resource:?}: Revoke sent to client {owner} \
-                         ({queued} waiter(s) dropped)"
-                    );
-                }
-                None => {
-                    warn!("Withdrawing {resource:?} ({queued} waiter(s) dropped)");
-                    slots.remove(&resource);
-                }
-            }
         }
     }
 }
@@ -475,7 +633,17 @@ fn grant_next(
     slot: &mut Slot,
     control_reg: &HashMap<ClientId, mpsc::UnboundedSender<ControlMessage>>,
 ) {
-    while let Some(waiter) = slot.pop_waiter() {
+    loop {
+        // A seat claim outranks the queue order (and `first-owner`'s refusal to
+        // serve waiters at all): the app on the display is never left waiting
+        // behind a client that has no display.
+        let waiter = match slot.pop_seat_claim() {
+            Some(waiter) => waiter,
+            None => match slot.pop_waiter() {
+                Some(waiter) => waiter,
+                None => return,
+            },
+        };
         match control_reg.get(&waiter.client) {
             Some(control)
                 if control
@@ -773,73 +941,197 @@ mod engine_tests {
         // Offering twice is what a re-created device node looks like: the slot
         // is kept, not duplicated.
         engine.offer(keyboard.clone(), Policy::FairQueue).await;
+        // Input goes with the display, so the display comes first.
+        assert!(matches!(
+            engine.acquire(cid(1), fbdev()).await,
+            AcquireOutcome::Granted
+        ));
         assert!(matches!(
             engine.acquire(cid(1), keyboard.clone()).await,
             AcquireOutcome::Granted
         ));
-        // The immediate grant goes out on the client's own wire write.
+        // The immediate grants go out on the client's own wire write.
         assert!(a.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn withdrawn_resource_revokes_holder_and_is_forgotten() {
+    async fn input_without_a_display_is_low_priority() {
         let engine = engine(Policy::FairQueue);
         let mut a = connect(&engine, 1).await;
+        let mut b = connect(&engine, 2).await;
         let keyboard = keyboard();
+        // first-owner on the device, so the seat's claim has to beat that too.
+        engine.offer(keyboard.clone(), Policy::FirstOwner).await;
 
+        // A has no display: it may hold a device nobody wants...
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+        // ...but another client with no display cannot take it, or even wait for
+        // it: a queued low-priority waiter would be served ahead of the seat.
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Denied { reason } if reason.contains("only the app on the display")
+        ));
+        assert!(b.try_recv().is_err());
+
+        // B takes the display, so B is the app on screen: it takes the device
+        // from A whatever the resource's policy says.
+        assert!(matches!(
+            engine.acquire(cid(2), fbdev()).await,
+            AcquireOutcome::Granted
+        ));
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Queued
+        ));
+        assert!(matches!(
+            next_control(&mut a).await,
+            ControlMessage::Revoke { resource } if resource == keyboard
+        ));
+        engine.release(cid(1), keyboard.clone()).await;
+        assert!(matches!(
+            next_control(&mut b).await,
+            ControlMessage::Grant { resource } if resource == keyboard
+        ));
+    }
+
+    #[tokio::test]
+    async fn leaving_the_seat_releases_its_inputs() {
+        let engine = engine(Policy::FairQueue);
+        let mut a = connect(&engine, 1).await;
+        let mut b = connect(&engine, 2).await;
+        let keyboard = keyboard();
         engine.offer(keyboard.clone(), Policy::FairQueue).await;
+
+        // A is the app on screen: display, then its device.
+        assert!(matches!(
+            engine.acquire(cid(1), fbdev()).await,
+            AcquireOutcome::Granted
+        ));
         assert!(matches!(
             engine.acquire(cid(1), keyboard.clone()).await,
             AcquireOutcome::Granted
         ));
 
-        // The device goes away: its holder is asked to leave.
-        engine.withdraw(keyboard.clone()).await;
+        // A gives the display up: nobody keeps input off-screen, so A is asked
+        // for the keyboard with it.
+        engine.release(cid(1), fbdev()).await;
         assert!(matches!(
             next_control(&mut a).await,
             ControlMessage::Revoke { resource } if resource == keyboard
         ));
-        // And nobody new can take it in the meantime.
-        assert!(matches!(
-            engine.acquire(cid(2), keyboard.clone()).await,
-            AcquireOutcome::Denied { reason } if reason.contains("no longer available")
-        ));
 
-        // The revoke-ack Release retires the slot: the resource is gone, not
-        // merely unowned.
+        // B becomes the app on screen and can take the device once A answers.
+        assert!(matches!(
+            engine.acquire(cid(2), fbdev()).await,
+            AcquireOutcome::Granted
+        ));
         engine.release(cid(1), keyboard.clone()).await;
         assert!(matches!(
-            engine.acquire(cid(1), keyboard.clone()).await,
-            AcquireOutcome::Denied { reason } if reason.contains("not registered")
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Granted
         ));
+        assert!(b.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn withdrawn_resource_drops_its_queue() {
+    async fn preempted_seat_loses_its_inputs() {
         let engine = engine(Policy::FairQueue);
         let mut a = connect(&engine, 1).await;
         let mut b = connect(&engine, 2).await;
-        let mut c = connect(&engine, 3).await;
+        let keyboard = keyboard();
+        engine.offer(keyboard.clone(), Policy::FairQueue).await;
+
+        engine.acquire(cid(1), fbdev()).await;
+        engine.acquire(cid(1), keyboard.clone()).await;
+
+        // B takes the screen: A is asked for the display...
+        assert!(matches!(
+            engine.acquire(cid(2), fbdev()).await,
+            AcquireOutcome::Queued
+        ));
+        assert!(matches!(
+            next_control(&mut a).await,
+            ControlMessage::Revoke { resource } if resource == Resource::Fbdev
+        ));
+
+        // ...and when A hands it over, the input goes with the seat.
+        engine.release(cid(1), fbdev()).await;
+        assert!(matches!(
+            next_control(&mut b).await,
+            ControlMessage::Grant { resource } if resource == Resource::Fbdev
+        ));
+        assert!(matches!(
+            next_control(&mut a).await,
+            ControlMessage::Revoke { resource } if resource == keyboard
+        ));
+        engine.release(cid(1), keyboard.clone()).await;
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+    }
+
+    /// A device that is unplugged is NOT revoked: its holder keeps the
+    /// resource, nobody else can take it, and the client is handed a fresh fd
+    /// when the device comes back — no re-acquire, no gap for a race.
+    #[tokio::test]
+    async fn an_unplugged_device_keeps_its_holder() {
+        let engine = engine(Policy::FairQueue);
+        let mut a = connect(&engine, 1).await;
         let keyboard = keyboard();
 
         engine.offer(keyboard.clone(), Policy::FairQueue).await;
-        engine.acquire(cid(1), keyboard.clone()).await; // granted
+        engine.acquire(cid(1), fbdev()).await; // A is the app on screen
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+
+        // The device goes away.
+        engine.suspend(keyboard.clone()).await;
+        // Nobody is revoked — there is nothing on A's control channel.
+        assert!(a.try_recv().is_err());
+        // And nothing else can take the name while the device is away.
         assert!(matches!(
             engine.acquire(cid(2), keyboard.clone()).await,
-            AcquireOutcome::Queued
+            AcquireOutcome::Denied { reason } if reason.contains("device is away")
         ));
-        let _ = next_control(&mut a).await; // Revoke, for B
 
-        // The device is gone while B is still queued for it: B can never be
-        // granted it, so it is dropped rather than left believing a Grant is
-        // still coming.
-        engine.withdraw(keyboard.clone()).await;
+        // The device is back: same client, same resource, fresh fd.
+        engine.resume(keyboard.clone()).await;
         assert!(matches!(
-            engine.acquire(cid(3), keyboard.clone()).await,
-            AcquireOutcome::Denied { reason } if reason.contains("no longer available")
+            next_control(&mut a).await,
+            ControlMessage::Grant { resource } if resource == keyboard
+        ));
+        // Still A's: only A releasing it can change that.
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Denied { reason } if reason.contains("already owned")
         ));
         engine.release(cid(1), keyboard.clone()).await;
-        assert!(b.try_recv().is_err());
-        assert!(c.try_recv().is_err());
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+    }
+
+    /// A suspended device whose holder went away comes back to nobody: it is
+    /// simply available again (the resource layer re-advertises it).
+    #[tokio::test]
+    async fn a_suspended_device_outlives_its_holder() {
+        let engine = engine(Policy::FairQueue);
+        engine.offer(keyboard(), Policy::FairQueue).await;
+        engine.acquire(cid(1), keyboard()).await;
+        engine.suspend(keyboard()).await;
+        engine.disconnected(cid(1)).await;
+        engine.resume(keyboard()).await;
+
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard()).await,
+            AcquireOutcome::Granted
+        ));
     }
 }

@@ -136,9 +136,15 @@ other command arrives. No per-waiter timers, no busy polling.
 flowchart TD
     A["Acquire {client, resource}"] --> B{"resource<br/>registered?"}
     B -- no --> D["reply Denied: not registered"]
-    B -- yes --> C{"client already<br/>the owner?"}
+    B -- yes --> B2{"device away<br/>(suspended)?"}
+    B2 -- yes --> D2["reply Denied: not available while<br/>its device is away — its holder keeps it"]
+    B2 -- no --> S{"Input, already held, and the<br/>requester has no display?"}
+    S -- yes --> D3["reply Denied: only the app on<br/>the display can take it"]
+    S -- no --> C{"client already<br/>the owner?"}
     C -- yes --> E["reply Denied: already owned"]
-    C -- no --> F["policy.decide(slot.state)"]
+    C -- no --> SC{"Input, the requester is the seat,<br/>and the holder is not?"}
+    SC -- yes --> ST["push seat claim + Revoke the holder<br/>reply Queued (policy not consulted)"]
+    SC -- no --> F["policy.decide(slot.state)"]
     F -- "Grant (Free) — all policies" --> G["owner = client<br/>reply Granted"]
     F -- "Deny — FirstOwner only" --> H["reply Denied: owned by client N"]
     F -- "RevokeAndQueue / Queue —<br/>LatestOwner & FairQueue" --> I{"already in<br/>waiters?"}
@@ -151,10 +157,12 @@ flowchart TD
 
 Where the policies differ in this chart: only at `policy.decide` — FirstOwner
 takes Deny, the two preemptive policies take the queue path. Everything
-before F (registered? already owner?) is policy-agnostic engine logic, and
-LatestOwner vs FairQueue are IDENTICAL from F down: their difference lives
-in the FREE path (which waiter `grant_next` pops — pop_back vs pop_front —
-and where the requeue lands), not in the Acquire path at all.
+before F (registered? suspended? input class? already owner?) is
+policy-agnostic engine logic, and LatestOwner vs FairQueue are IDENTICAL from F
+down: their difference lives in the FREE path (which waiter `grant_next` pops —
+pop_back vs pop_front — and where the requeue lands), not in the Acquire path at
+all. The seat-claim branch is the one place the policy is bypassed entirely —
+see "The seat" below.
 
 Notes on the preemptive path:
 
@@ -163,6 +171,59 @@ Notes on the preemptive path:
   leave.
 - The "first waiter starts the revoke" rule means only one Revoke is ever in
   flight per resource, no matter how many apps pile up behind.
+
+## The seat — input is owned by class
+
+Input has two classes of holder, and the class decides who wins:
+
+- **The seat** is the client that holds the display — `Drm { card }` or
+  `Fbdev` (`is_display`). One seat at a time: the daemon does not support several
+  displays, so "the app on the display" is unambiguous.
+- **A client with no display** may still hold a device, but only one nobody else
+  is asking for, and it holds it last.
+
+| situation | outcome |
+| --- | --- |
+| seat asks for a free device | granted |
+| seat asks for a device a display-less client holds | **stolen** — that holder is revoked and the seat is served, whatever the resource's policy says (`first-owner` does not protect a background holder from the app on screen) |
+| seat asks for a device another seat holds | unreachable today; the policy applies |
+| display-less client asks for a free device | granted — this is how a helper (hardware buttons, accessibility, a recorder) can exist |
+| display-less client asks for a held device | denied — it never preempts, and it never queues |
+| the seat leaves or changes hands (Release, preemption handoff, force-reclaim after the deadline, disconnect) | the devices the former seat held are revoked with it (`release_seat_inputs`), so nothing is held off-screen |
+
+Two details carry the design:
+
+- **The low class never queues.** A queued display-less waiter would be served
+  ahead of the seat the moment the device freed (FIFO), and the app on screen
+  would wait behind a background client. Its Acquire is grant-if-free, otherwise
+  denied.
+- **A seat claim is a marked waiter** (`Waiter::seat_claim`). Stealing means
+  queueing a claim while the current holder is asked to Release, and `grant_next`
+  serves a seat claim before any other waiter and regardless of policy —
+  `first-owner` never serves waiters, but it has to serve this one, or the app on
+  screen would never get the device back.
+
+Costs, stated plainly: the seat can wait up to the revoke deadline (5 s) if the
+display-less holder is wedged, before force-reclaim hands it the device; and an
+app that is preempted and later re-granted the display comes back as the seat and
+has to acquire its devices again — client-side work, not the engine's (at the
+time of writing the linuxsgc backend does not do it yet; see
+`linuxsgc/docs/input.md`).
+
+**A device that leaves the machine is not a revocation.** Unplugging a mouse or
+a keyboard does not take the resource from its holder: the slot is SUSPENDED
+(`PolicyEngine::suspend`) — ownership, queue and policy are untouched, only the
+resource leaves the advertised list, because it cannot be granted while its
+device is away. The holder's fd dies, which is what libinput reports to it as
+`DEVICE_REMOVED` and what it acts on (drop the device, keep the claim). When the
+device comes back the resource RESUMES and the same client is handed a fresh fd
+for the name it never lost (`PolicyEngine::resume`) — no re-acquire, and no
+window in which another client could take it. The cost of that guarantee: while
+a device is away, its name stays reserved for the client that held it.
+
+Not covered: fbdev and DRM are two access paths to the same panel, and this rule
+treats either as the display — two clients could each hold one and each count as
+the seat. That is the group question in "Exclusion groups" below.
 
 ## The three policies, step by step
 
@@ -378,4 +439,6 @@ NOT implemented yet: with `Resource::Drm` exposed, per-resource slots no
 longer express that Fbdev and Drm are two access paths to the SAME panel — a
 Drm grant while Fbdev is held, or vice versa, must be arbitrated as one
 group, not two independent slots. The group is the next step after the
-per-backend resource work (see resource-manager.md).
+per-backend resource work (see resource-manager.md). It also sharpens the seat
+rule above: today either resource makes a client the seat, so two clients could
+each hold one access path and each hold devices.

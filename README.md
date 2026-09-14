@@ -47,19 +47,31 @@ flowchart LR
 A build without a backend never advertises it, and `Acquire` against it is
 denied "not registered".
 
+Input is owned by class: the client holding the display (`Drm` or `Fbdev` — the
+*seat*) takes a device from a client that has none, and such a client may only
+hold a device nobody else is asking for; leaving the display revokes the devices
+that went with it, so nothing is held off-screen — but a device that is UNPLUGGED
+is never revoked, it is suspended for its holder and comes back to it. See
+[docs/policy-engine.md](docs/policy-engine.md#the-seat--input-is-owned-by-class).
+
 Input is not a boot-time snapshot: the daemon watches `/dev/input` and
 reconciles on every change, so a device plugged in while it runs is opened and
-advertised, and one that goes away is withdrawn (its holder is revoked). A device
-node that udev re-creates under it is re-opened for later grants without
-disturbing the client holding it. A safety pass every 60 s covers anything the
-watch cannot see. See [docs/resource-manager.md](docs/resource-manager.md).
+advertised. A device that goes AWAY is not taken from whoever holds it — the
+resource is suspended: it leaves the advertised list, its holder keeps it, and
+when the device comes back the same client is handed a fresh fd for it (no
+re-acquire, no window in which another client could take the name). The updated
+list is pushed to every connected client, so a device that appears reaches a
+client that is already running. A device node that udev re-creates under it is
+re-opened for later grants without disturbing the client holding it. A safety
+pass every 60 s covers anything the watch cannot see. See
+[docs/resource-manager.md](docs/resource-manager.md).
 
 ## Limitations
 
-- **A device that appears later reaches later clients only** — the advertised
-  list is sent once per connection, so an already-connected client is not told
-  about a device that appears after it connected (a device REMOVED while a
-  client holds it does reach it: the holder is revoked).
+- **A revoked input is not re-granted by the engine** — the daemon revokes a
+  device when the device disappears or when its holder leaves the seat, and
+  asking for it again is the client's business (the linuxsgc backend does it when
+  it is re-granted the display).
 
 ## Policies — `SGC_POLICY`
 

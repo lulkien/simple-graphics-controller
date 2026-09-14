@@ -61,6 +61,14 @@ impl InputClass {
             InputResource::Touch(_) => InputClass::Touch,
         }
     }
+
+    /// The class of a whole resource, `None` when it is not input at all.
+    pub(crate) fn of_resource(resource: &Resource) -> Option<Self> {
+        match resource {
+            Resource::Input(input) => Some(InputClass::of(input)),
+            _ => None,
+        }
+    }
 }
 
 /// One input device the server holds: which resource it is, the identity of the
@@ -79,6 +87,11 @@ pub struct HeldInput {
     /// `/sys/class/input/eventN/device` resolved — `None` when sysfs has no
     /// answer (then a re-created node is treated as a different device).
     pub device: Option<PathBuf>,
+    /// The device is gone (unplugged). The server keeps the entry — and with it
+    /// the resource and its holder — so the device that comes back resumes the
+    /// same resource instead of being adopted as a new one. See
+    /// [`super::hotplug`].
+    pub suspended: bool,
 }
 
 /// The held input devices, keyed by devnode path.
@@ -113,6 +126,7 @@ pub(super) fn open_devices(
                 dev,
                 ino,
                 device: device_identity(&device.path),
+                suspended: false,
             },
         );
         info!(

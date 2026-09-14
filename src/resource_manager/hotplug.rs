@@ -24,10 +24,13 @@
 //! reconciler falls back to polling every [`FALLBACK_INTERVAL`] — the behaviour
 //! it had before the watch existed.
 //!
-//! Removal is not just bookkeeping: a device that is gone must stop being
-//! advertised, and whoever holds it must be revoked (the holder's fd is dead —
-//! it points at the removed node). The engine handles the revoke handshake; see
-//! [`PolicyEngine::withdraw`].
+//! A device that goes away is not revoked — it is **suspended**: the resource
+//! keeps its holder, leaves the advertised list while the device is away, and
+//! is handed back to that same client (fresh fd, same name) the moment the
+//! device returns. Unplugging a mouse must not cost a running app its mouse for
+//! the rest of its life, and it must not cost it a re-acquire that a client with
+//! no display could win the race for. See [`PolicyEngine::suspend`] and
+//! [`PolicyEngine::resume`].
 
 use std::{
     os::fd::{AsFd, OwnedFd},
@@ -48,7 +51,7 @@ use super::input::{self, HeldInput, InputClass, InputIndex};
 use crate::{
     resource_manager::ResourceRegistries,
     types::AdvertisedResources,
-    windowing::{Policy, PolicyEngine},
+    windowing::{ControlMessage, Policy, PolicyEngine},
 };
 
 /// The directory whose changes wake the reconciler.
@@ -250,6 +253,25 @@ async fn reconcile(
             // every device on every pass.
             Some(held) if current == Some((held.dev, held.ino)) => {}
 
+            // The device is back at the node it had: its holder kept the
+            // resource while it was away, so it gets a fresh fd for this device.
+            Some(held) if held.suspended => {
+                if !resume(
+                    registries,
+                    index,
+                    advertised,
+                    engine,
+                    &device.path,
+                    &device.path,
+                    &device.name,
+                    &held,
+                )
+                .await
+                {
+                    retry = true;
+                }
+            }
+
             // The node was re-created for the SAME device (a udev trigger —
             // installing anything with udev rules runs one — unlinks and
             // re-creates eventN). The device never went away, so a holder's fd
@@ -263,56 +285,86 @@ async fn reconcile(
                 }
             }
 
-            // A different device under a name we already use: the old one is
-            // gone (its fd is dead), the new one takes over the resource.
+            // A different device under a name we already use. If the old device
+            // is still there (an odd udev event) the holder's fd keeps working:
+            // only the server's fd moves to the current node. If it is gone,
+            // this is a device replaced inside one pass — the holder still owns
+            // the name and gets the new device's fd, exactly as if the daemon
+            // had seen the gap.
             Some(held) => {
-                info!(
-                    "{} is now a different device ({:?} replaced); handing the name over",
-                    device.path.display(),
-                    held.resource
-                );
-                withdraw(
-                    registries,
-                    index,
-                    advertised,
-                    engine,
-                    &device.path,
-                    &held.resource,
-                )
-                .await;
-                if !adopt(
-                    registries,
-                    index,
-                    advertised,
-                    engine,
-                    policy,
-                    &device.path,
-                    &device.name,
-                    device.class,
-                )
-                .await
-                {
+                let replaced = held.device.as_ref().is_some_and(|device| device.exists());
+                if !replaced {
+                    info!(
+                        "{} is now a different device ({:?} was replaced); its holder keeps the name",
+                        device.path.display(),
+                        held.resource
+                    );
+                }
+                let taken = if replaced {
+                    reopen(registries, index, &device.path, &held.resource)
+                } else {
+                    resume(
+                        registries,
+                        index,
+                        advertised,
+                        engine,
+                        &device.path,
+                        &device.path,
+                        &device.name,
+                        &held,
+                    )
+                    .await
+                };
+                if !taken {
                     retry = true;
                 }
             }
 
-            // Something new.
-            None => {
-                if !adopt(
-                    registries,
-                    index,
-                    advertised,
-                    engine,
-                    policy,
-                    &device.path,
-                    &device.name,
-                    device.class,
-                )
-                .await
-                {
-                    retry = true;
+            // Something new — unless it is the device a suspended resource is
+            // waiting for. A device that comes back on a DIFFERENT node (a replug
+            // into another port) still belongs to the client that held that name:
+            // it asked for "the mouse", not for a specific devnode.
+            None => match suspended_peer(index, device.class) {
+                Some((old_path, held)) => {
+                    info!(
+                        "{} ({}) takes over {:?} from {}: the device is back on another node",
+                        device.path.display(),
+                        device.name,
+                        held.resource,
+                        old_path.display()
+                    );
+                    if !resume(
+                        registries,
+                        index,
+                        advertised,
+                        engine,
+                        &old_path,
+                        &device.path,
+                        &device.name,
+                        &held,
+                    )
+                    .await
+                    {
+                        retry = true;
+                    }
                 }
-            }
+                None => {
+                    if !adopt(
+                        registries,
+                        index,
+                        advertised,
+                        engine,
+                        policy,
+                        &device.path,
+                        &device.name,
+                        device.class,
+                    )
+                    .await
+                    {
+                        retry = true;
+                    }
+                }
+            },
         }
     }
 
@@ -322,7 +374,7 @@ async fn reconcile(
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
     for (path, held) in held {
-        if present.contains(&path) {
+        if held.suspended || present.contains(&path) {
             continue;
         }
         // The node is absent, but is the DEVICE still there? A node that is
@@ -332,12 +384,7 @@ async fn reconcile(
         if held.device.as_ref().is_some_and(|device| device.exists()) {
             continue;
         }
-        info!(
-            "{} is gone; withdrawing {:?}",
-            path.display(),
-            held.resource
-        );
-        withdraw(registries, index, advertised, engine, &path, &held.resource).await;
+        suspend(registries, index, advertised, engine, &path, &held).await;
     }
 
     retry
@@ -374,6 +421,7 @@ fn reopen(
             dev,
             ino,
             device: input::device_identity(path),
+            suspended: false,
         },
     );
     info!(
@@ -421,36 +469,108 @@ async fn adopt(
             dev,
             ino,
             device: input::device_identity(path),
+            suspended: false,
         },
     );
     advertised.insert(resource.clone());
+    // Offer BEFORE pushing: a client that acts on the pushed list immediately
+    // asks for the resource, and that Acquire has to be accepted.
     engine.offer(resource.clone(), policy).await;
     info!(
         "Opened {} ({name}): {resource:?} (fd {raw}, plugged in while running)",
         path.display()
     );
+    push(advertised, engine).await;
     true
 }
 
-/// Stop offering a device and revoke its holder. The fd closes with the
-/// registry entry, which also means a later re-`adopt` of the same path opens
-/// the CURRENT node.
-async fn withdraw(
+/// The device is gone. Nothing is revoked: the resource, and the client holding
+/// it, stay exactly as they are — only the resource leaves the advertised list
+/// (it cannot be granted while its device is away). The entry stays in the
+/// index, marked suspended, so the device that comes back resumes the same name
+/// instead of being adopted as something new.
+async fn suspend(
     registries: &ResourceRegistries,
     index: &InputIndex,
     advertised: &AdvertisedResources,
     engine: &PolicyEngine,
     path: &Path,
-    resource: &Resource,
+    held: &HeldInput,
 ) {
-    advertised.remove(resource);
-    engine.withdraw(resource.clone()).await;
-    registries.fds.remove(resource);
-    index.remove(path);
+    advertised.remove(&held.resource);
+    engine.suspend(held.resource.clone()).await;
+    registries.fds.remove(&held.resource);
+    index.insert(
+        path.to_path_buf(),
+        HeldInput {
+            suspended: true,
+            ..held.clone()
+        },
+    );
     warn!(
-        "Withdrew {resource:?} ({}): the device is gone; a client holding it is being revoked",
+        "Suspended {:?} ({}): the device is gone; its holder keeps it and is told when it is back",
+        held.resource,
         path.display()
     );
+    push(advertised, engine).await;
+}
+
+/// The device is back. Whoever held the resource still holds it — there is no
+/// re-acquire, and no window in which another client could take the name — so
+/// all that is left is to hand that client a fresh fd for the device that
+/// returned. `false` if the node would not open yet.
+///
+/// Order matters: the fd is registered BEFORE the engine re-grants, because the
+/// grant is a dup of that registry entry.
+#[allow(clippy::too_many_arguments)]
+async fn resume(
+    registries: &ResourceRegistries,
+    index: &InputIndex,
+    advertised: &AdvertisedResources,
+    engine: &PolicyEngine,
+    old_path: &Path,
+    path: &Path,
+    name: &str,
+    held: &HeldInput,
+) -> bool {
+    let resource = held.resource.clone();
+    let Some((fd, dev, ino)) = input::open_device(path) else {
+        return false;
+    };
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+    registries.fds.insert(resource.clone(), fd);
+    if old_path != path {
+        index.remove(old_path);
+    }
+    index.insert(
+        path.to_path_buf(),
+        HeldInput {
+            resource: resource.clone(),
+            dev,
+            ino,
+            device: input::device_identity(path),
+            suspended: false,
+        },
+    );
+    advertised.insert(resource.clone());
+    engine.resume(resource.clone()).await;
+    info!(
+        "Resumed {resource:?} ({} ({name}), fd {raw}): the device is back with its holder — no re-acquire",
+        path.display()
+    );
+    push(advertised, engine).await;
+    true
+}
+
+/// Tell every connected client what the server offers now. Without this, a
+/// client's view is whatever it was handed at connect time — which is what kept
+/// a device that appeared later invisible to it.
+async fn push(advertised: &AdvertisedResources, engine: &PolicyEngine) {
+    engine
+        .broadcast(ControlMessage::Advertise {
+            available_resources: advertised.snapshot(),
+        })
+        .await;
 }
 
 /// The lowest per-class index no held device uses. A replug therefore lands on
@@ -458,17 +578,38 @@ async fn withdraw(
 fn free_index(index: &InputIndex, class: InputClass) -> Option<u8> {
     let mut used: Vec<u8> = index
         .iter()
-        .filter_map(|entry| match &entry.value().resource {
-            Resource::Input(input) if InputClass::of(input) == class => Some(match input {
-                InputResource::Mouse(index)
-                | InputResource::Keyboard(index)
-                | InputResource::Touch(index) => *index,
-            }),
-            _ => None,
-        })
+        .filter(|entry| InputClass::of_resource(&entry.value().resource) == Some(class))
+        .filter_map(|entry| resource_index(&entry.value().resource))
         .collect();
     used.sort_unstable();
     (0u8..=u8::MAX).find(|candidate| !used.contains(candidate))
+}
+
+/// A suspended resource of `class` whose device has not come back, lowest name
+/// first. Used when a device appears on a node we do not hold: it may be the
+/// device a suspended resource is waiting for, returning on a different node.
+fn suspended_peer(index: &InputIndex, class: InputClass) -> Option<(PathBuf, HeldInput)> {
+    let mut candidates: Vec<(PathBuf, HeldInput)> = index
+        .iter()
+        .filter(|entry| entry.value().suspended)
+        .filter(|entry| InputClass::of_resource(&entry.value().resource) == Some(class))
+        .filter(|entry| !entry.key().exists())
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+    candidates.sort_by_key(|(_, held)| resource_index(&held.resource));
+    candidates.into_iter().next()
+}
+
+/// The per-class index of an input resource (`Keyboard(1)` → 1).
+fn resource_index(resource: &Resource) -> Option<u8> {
+    match resource {
+        Resource::Input(
+            InputResource::Mouse(index)
+            | InputResource::Keyboard(index)
+            | InputResource::Touch(index),
+        ) => Some(*index),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +618,10 @@ mod tests {
     use crate::resource_manager::input::new_index;
 
     fn hold(index: &InputIndex, resource: Resource, path: &str) {
+        hold_as(index, resource, path, false);
+    }
+
+    fn hold_as(index: &InputIndex, resource: Resource, path: &str, suspended: bool) {
         index.insert(
             PathBuf::from(path),
             HeldInput {
@@ -484,6 +629,7 @@ mod tests {
                 dev: 0,
                 ino: 0,
                 device: None,
+                suspended,
             },
         );
     }
@@ -509,6 +655,39 @@ mod tests {
             "/dev/input/event3",
         );
         assert_eq!(free_index(&index, InputClass::Mouse), Some(1));
+    }
+
+    /// A suspended resource is one whose device has not come back: a device that
+    /// appears on a node nobody holds may be that device returning somewhere
+    /// else, and the name it takes over has to be the one its holder holds.
+    /// Lowest name first, and only for a node that is really gone.
+    #[test]
+    fn a_suspended_resource_waits_for_a_device_of_its_own_class() {
+        let index = new_index();
+        hold_as(
+            &index,
+            Resource::Input(InputResource::Mouse(0)),
+            "/tmp/sgc-no-such-node-5",
+            true,
+        );
+        hold_as(
+            &index,
+            Resource::Input(InputResource::Mouse(1)),
+            "/tmp/sgc-no-such-node-6",
+            true,
+        );
+        hold(
+            &index,
+            Resource::Input(InputResource::Keyboard(0)),
+            "/dev/input/event1",
+        );
+
+        assert_eq!(
+            suspended_peer(&index, InputClass::Mouse).map(|(_, held)| held.resource),
+            Some(Resource::Input(InputResource::Mouse(0)))
+        );
+        assert!(suspended_peer(&index, InputClass::Keyboard).is_none());
+        assert!(suspended_peer(&index, InputClass::Touch).is_none());
     }
 
     /// The fallback path is chosen by this failing (no `/dev/input` yet, early
