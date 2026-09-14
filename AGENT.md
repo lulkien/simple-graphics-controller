@@ -8,7 +8,7 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 - **Three compile-time backends** — `drm` (default, fresh kernel lease), `input` (default, dup fd), `fbdev` (opt-in, dup fd); a build without a backend never advertises it, and `Acquire` against it is denied "not registered"
 - **One task per connection** — client task handles one connection; policy engine sends control messages (Revoke/Grant); client task drives the protocol
 - **Ask-first revoke** — the wire `Revoke` is a request; the owner's `Release` is the ack, then it is requeued for one more turn; a silent owner is force-reclaimed after 5s (no requeue); for DRM the kernel `revoke` runs at the handoff, so a revoked client keeps a valid lease through the grace window and can finish its frame
-- **Holdings** — the daemon's grant sources: static fds for Fbdev/Input (grants are dups); DRM lease factories create fresh lease fds per grant; the server never closes the master fds
+- **Inventory** — the daemon's held devices: static fds for Fbdev/Input (grants are dups); DRM lease factories create fresh lease fds per grant; the server never closes the master fds
 
 ## Rust Best Practices (per rust-skills, applied to daemon)
 - [`own-borrow-over-clone`] — Grants are dups of the daemon's static fds; the canonical stays with the daemon; `fd()` lends dups (client owns the dup). See `resource_manager::open_resources` and `client_handler::wire`
@@ -43,13 +43,12 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 - `Policy` — enum: `FairQueue` (default), `LatestOwner`, `FirstOwner`; arbitration policy
 - `PolicyEngine` — spawned on one task (`PolicyEngine::spawn(policies)`); arbitrates all resource grants/denies/revokes; one global engine for all resources
 - `ResourceRegistry = Arc<DashMap<Resource, OwnedFd>>` — shared across server + client tasks; holds static fds for Fbdev/Input; DRM leases created per grant
-- `Holdings` — private `fds` + `drm` + `inputs`; `grant_fd()`/`revoke_lease()` here, the input transitions in `impl Holdings` (hotplug.rs). Grant factories); cloned per client connection
-- `Inventory` — returned by `open_resources()`; holdings + advertised order
+- `Inventory` — the daemon's devices: private `fds` + `drm` + `inputs`, with `grant_fd()`/`revoke_lease()` and the input transitions (`impl Inventory`, hotplug.rs) as methods; `open_resources()` returns `(Inventory, Vec<Resource>)`
 - `ClientId(u64)` — server-assigned monotonic identity for a connected client; keyed on connection not pid
 - `sgns_client_handler::wire` — wire protocol messages: `ControlMessage` (Revoke/Grant), `ClientMessage` (Acquire/Release/Ack)
 - `client_handler::control` — per-connection state: `ClientHandler` owns the stream, sessions, and resource borrows
 - `windowing::engine` — DRM lease management: `build` connects @sgc + acquires the Drm lease (sgc or die); `revoke=suspend`, `re-grant=rebuild`
-- `server::run` — the accept loop: `server::run(engine, holdings, advertised).await`
+- `server::run` — the accept loop: `server::run(engine, inventory, advertised).await`
 
 ## Policy Engine Policies
 | policy | newcomer when resource held | waiters served |

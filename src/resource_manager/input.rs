@@ -17,7 +17,7 @@ use evdev::{AbsoluteAxisType, Device as EvdevDevice, Key, RelativeAxisType};
 use simple_graphics_protocol::{InputResource, Resource};
 use tracing::{debug, error, info};
 
-use super::Holdings;
+use super::Inventory;
 
 /// One discovered input device, ready to be opened and registered.
 pub struct DiscoveredDevice {
@@ -91,7 +91,7 @@ pub struct HeldInput {
     /// the resource and its holder — so the device that comes back resumes the
     /// same resource instead of being adopted as a new one. See
     /// [`super::hotplug`].
-    pub suspended: bool,
+    pub device_gone: bool,
 }
 
 /// The held input devices, keyed by devnode path.
@@ -105,7 +105,7 @@ pub fn new_index() -> InputIndex {
 /// Open and register every input device the discovery [`discover`] found.
 /// Each registry fd is the server's own open; grants dup it (the client
 /// parses evdev events straight off the dup — no path needed).
-pub(super) fn open_devices(holdings: &Holdings, advertised: &mut Vec<Resource>) {
+pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>) {
     for device in discover() {
         let Some((fd, dev, ino)) = open_device(&device.path) else {
             continue;
@@ -113,16 +113,16 @@ pub(super) fn open_devices(holdings: &Holdings, advertised: &mut Vec<Resource>) 
 
         let resource = Resource::Input(device.resource);
         let raw = fd.as_raw_fd();
-        holdings.fds.insert(resource.clone(), fd);
+        inventory.fds.insert(resource.clone(), fd);
         advertised.push(resource.clone());
-        holdings.inputs.insert(
+        inventory.inputs.insert(
             device.path.clone(),
             HeldInput {
                 resource: resource.clone(),
                 dev,
                 ino,
                 device: device_identity(&device.path),
-                suspended: false,
+                device_gone: false,
             },
         );
         info!(

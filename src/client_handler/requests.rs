@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 
 use crate::{
     error::{ServerError, ServerResult},
-    resource_manager::Holdings,
+    resource_manager::Inventory,
     types::ClientId,
     windowing::{AcquireOutcome, PolicyEngine},
 };
@@ -25,7 +25,7 @@ pub(super) async fn dispatch_request(
     client_id: ClientId,
     client_pid: pid_t,
     engine: &PolicyEngine,
-    holdings: &Holdings,
+    inventory: &Inventory,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     match req {
@@ -36,13 +36,13 @@ pub(super) async fn dispatch_request(
                 client_pid,
                 resource,
                 engine,
-                holdings,
+                inventory,
                 ack_deadline,
             )
             .await?;
         }
         ClientRequest::Release { resource } => {
-            handle_release(client_id, resource, engine, holdings).await;
+            handle_release(client_id, resource, engine, inventory).await;
         }
         ClientRequest::Ack => {
             info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
@@ -62,7 +62,7 @@ pub(super) async fn handle_acquire(
     client_pid: pid_t,
     resource: Resource,
     engine: &PolicyEngine,
-    holdings: &Holdings,
+    inventory: &Inventory,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] Acquire: {resource:?}");
@@ -75,7 +75,7 @@ pub(super) async fn handle_acquire(
             // ownership back so the next waiter can be served, reply Deny,
             // and keep the connection alive.
             if let Err(e) =
-                send_grant(stream, client_id, client_pid, resource.clone(), holdings).await
+                send_grant(stream, client_id, client_pid, resource.clone(), inventory).await
             {
                 warn!("[client {client_id} (pid {client_pid})] Grant failed for {resource:?}: {e}");
                 engine.release(client_id, resource.clone()).await;
@@ -113,13 +113,13 @@ pub(super) async fn send_grant(
     client_id: ClientId,
     client_pid: pid_t,
     resource: Resource,
-    holdings: &Holdings,
+    inventory: &Inventory,
 ) -> ServerResult<()> {
     // The granted fd must stay open until AFTER send_with_fd: SCM_RIGHTS
     // dups the fd at send time, and sending a number whose fd was already
     // closed fails with EBADF. Binding it here (not inside the match arm)
     // keeps it alive across the send.
-    let granted = holdings.grant_fd(&resource)?;
+    let granted = inventory.grant_fd(&resource)?;
     let fd = granted.as_raw_fd();
 
     info!("[client {client_id} (pid {client_pid})] Granted {resource:?} (fd {fd})");
@@ -139,8 +139,8 @@ pub(super) async fn handle_release(
     client_id: ClientId,
     resource: Resource,
     engine: &PolicyEngine,
-    holdings: &Holdings,
+    inventory: &Inventory,
 ) {
-    holdings.revoke_lease(&resource);
+    inventory.revoke_lease(&resource);
     engine.release(client_id, resource).await;
 }

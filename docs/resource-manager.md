@@ -54,7 +54,7 @@ boundary, never in the wire types.
 
 ```
 resource_manager/
-  mod.rs      Holdings, Inventory, open_resources()
+  mod.rs      Inventory, open_resources(), check_consistency()
   fbdev.rs    #[cfg(feature = "fbdev")]  open fbdev
   drm.rs      #[cfg(feature = "drm")]    DrmCard, DrmDevice, DrmRegistry
   input.rs    #[cfg(feature = "input")]  discovery + classification
@@ -65,7 +65,7 @@ resource_manager/
 /// method, because the order in which the fd table and the input index move is
 /// what keeps them consistent.
 #[derive(Clone)]
-pub struct Holdings {
+pub struct Inventory {
     fds: ResourceRegistry,          // static fds — grants are dups of these
     #[cfg(feature = "drm")]
     drm: DrmRegistry,               // lease factories — a fresh lease per grant
@@ -74,13 +74,13 @@ pub struct Holdings {
 }
 ```
 
-`open_resources()` runs only the enabled openers and returns an `Inventory`:
-the `Holdings` it opened, plus the `advertised` list in priority order (first
+`open_resources()` runs only the enabled openers and returns the `Inventory`
+plus the `advertised` list in priority order (first
 is best). The advertised list is the single source of truth for the engine's
 slots and the policy map — never registry keys.
 
-`Holdings` also carries the grant side of the request path (`grant_fd`,
-`revoke_lease`), and the input transitions live in `impl Holdings` in
+`Inventory` also carries the grant side of the request path (`grant_fd`,
+`revoke_lease`), and the input transitions live in `impl Inventory` in
 `hotplug.rs`, next to the reconciler that calls them.
 
 ## What owns what
@@ -91,8 +91,8 @@ fact has exactly one owner:
 | structure | owns | keyed by |
 | --- | --- | --- |
 | `PolicyEngine` | ownership and arbitration — who holds what, what is queued, what is suspended *to other clients* | `Resource` |
-| `Holdings.fds` | the grant *source* for Fbdev and Input: one canonical fd per resource, duplicated on grant | `Resource` |
-| `Holdings.drm` | the grant *source* for DRM: one lease factory per card, a fresh kernel lease per grant | `Resource` |
+| `Inventory.fds` | the grant *source* for Fbdev and Input: one canonical fd per resource, duplicated on grant | `Resource` |
+| `Inventory.drm` | the grant *source* for DRM: one lease factory per card, a fresh kernel lease per grant | `Resource` |
 | `InputIndex` | device identity (`dev`, `ino`, sysfs) and whether the devnode we opened is still ours | devnode path |
 | `AdvertisedResources` | a *derived view* — what the daemon offers, in priority order | — |
 
@@ -109,12 +109,18 @@ panics (a violation is a bug in the code above, not a reason to drop a board's
 session):
 
 1. one index entry per resource, keyed by the devnode it sits on;
-2. a LIVE entry (not suspended) is advertised, and its resource has an fd to
+2. a LIVE entry (`device_gone` false) is advertised, and its resource has an fd to
    grant;
-3. a SUSPENDED entry is neither advertised nor grantable — the holder keeps the
+3. a `device_gone` entry is neither advertised nor grantable — the holder keeps the
    name, the daemon keeps no way to hand it out;
 4. every advertised input has an index entry, and every input fd belongs to an
    advertised resource.
+
+The two flags are deliberately not the same word, because they are not the
+same fact: the engine's `suspended` means "unavailable to other clients", while
+the index's `HeldInput::device_gone` means "the devnode we opened is not there".
+One transition sets both, which is why they always agree — but only the engine's
+decides who may acquire.
 
 The transitions keep them true by their order, which is why that order is
 load-bearing: `suspend()` removes the resource from the advertised list and tells
