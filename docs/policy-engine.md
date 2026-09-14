@@ -206,8 +206,8 @@ Two details carry the design:
 Costs, stated plainly: the seat can wait up to the revoke deadline (5 s) if the
 display-less holder is wedged, before force-reclaim hands it the device; and an
 app that is preempted and later re-granted the display comes back as the seat and
-has to acquire its devices again — client-side work, not the engine's (at the
-time of writing the linuxsgc backend does not do it yet; see
+has to acquire its devices again — client-side work, not the engine's (the
+linuxsgc backend does it on the display re-grant: `reacquire_inputs`, see
 `linuxsgc/docs/input.md`).
 
 **A device that leaves the machine is not a revocation.** Unplugging a mouse or
