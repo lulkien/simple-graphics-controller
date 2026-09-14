@@ -77,6 +77,45 @@ plus the `advertised` list in priority order (first is best). The advertised
 list is the single source of truth for the engine's slots and the policy map
 — never registry keys.
 
+## What owns what
+
+Four structures describe the same devices from four different angles, and each
+fact has exactly one owner:
+
+| structure | owns | keyed by |
+| --- | --- | --- |
+| `PolicyEngine` | ownership and arbitration — who holds what, what is queued, what is suspended *to other clients* | `Resource` |
+| `ResourceRegistries.fds` | the grant *source* for Fbdev and Input: one canonical fd per resource, duplicated on grant | `Resource` |
+| `ResourceRegistries.drm` | the grant *source* for DRM: one lease factory per card, a fresh kernel lease per grant | `Resource` |
+| `InputIndex` | device identity (`dev`, `ino`, sysfs) and whether the devnode we opened is still ours | devnode path |
+| `AdvertisedResources` | a *derived view* — what the daemon offers, in priority order | — |
+
+`InputIndex` is not a grant source and holds no fd: it is the reconciler's
+bookkeeping, which is why an input device is described in two places and why
+`HeldInput.resource` is the only link between them.
+
+## The invariants between them
+
+Four rules tie those structures together. They are asserted in
+`check_consistency()` — called by unit tests that build states by hand, and at
+the end of every reconcile pass in debug builds, where it logs rather than
+panics (a violation is a bug in the code above, not a reason to drop a board's
+session):
+
+1. one index entry per resource, keyed by the devnode it sits on;
+2. a LIVE entry (not suspended) is advertised, and its resource has an fd to
+   grant;
+3. a SUSPENDED entry is neither advertised nor grantable — the holder keeps the
+   name, the daemon keeps no way to hand it out;
+4. every advertised input has an index entry, and every input fd belongs to an
+   advertised resource.
+
+The transitions keep them true by their order, which is why that order is
+load-bearing: `suspend()` removes the resource from the advertised list and tells
+the engine *before* it drops the fd, so no grant can land in between;
+`resume()` registers the fd *before* the engine re-grants, because the grant is
+a dup of that registry entry.
+
 ## Two registry kinds
 
 - **fds registry** (`Arc<DashMap<Resource, OwnedFd>>`) — fbdev and input.

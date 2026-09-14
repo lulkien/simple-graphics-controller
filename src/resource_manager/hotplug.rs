@@ -433,6 +433,14 @@ async fn reconcile(
         suspend(registries, index, advertised, engine, &path, &held).await;
     }
 
+    // The invariants this module maintains by hand, checked where they can
+    // break. Debug builds only: a violation is a bug in the code above, not
+    // something to take a board down over.
+    #[cfg(debug_assertions)]
+    for problem in super::check_consistency(&registries.fds, index, advertised) {
+        error!("resource invariant violated: {problem}");
+    }
+
     retry
 }
 
