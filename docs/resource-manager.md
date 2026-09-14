@@ -266,10 +266,10 @@ server match what it finds:
 | a device node with no index entry | open it, register the fd, `AdvertisedResources::insert`, `engine.offer(resource, policy)` — unless it is the device a SUSPENDED resource of the same class is waiting for, which it resumes instead |
 | the node was re-created for the SAME device (same `/sys/class/input/eventN/device`) | replace the server's fd only: no revoke, no offer — the holder's dup still works, and the next grant gets a path that resolves |
 | a DIFFERENT device now owns the node, and the old device still exists | replace the server's fd only — the holder's dup still works |
-| a DIFFERENT device now owns the node and the old device is gone (replaced within one pass) | resume: the holder keeps the resource and is handed the new device's fd |
+| a DIFFERENT device of the SAME class owns the node and the old device is gone (replaced within one pass) | resume: the holder keeps the resource and is handed the new device's fd |
 | the node is absent, but its device still exists (udev mid-re-creation) | nothing — it is not a removal; the node is re-opened when it returns |
 | the node and its device are gone (unplug) | `engine.suspend`: the resource leaves the advertised list and nothing else changes — its holder KEEPS it; the index entry stays, marked suspended |
-| the device of a suspended resource comes back (same node, or the same class on another node) | `engine.resume`: register the fresh fd, re-advertise, and re-grant the holder |
+| the device of a suspended resource comes back (the same node AND its class, or another node of the same class) | `engine.resume`: register the fresh fd, re-advertise, and re-grant the holder |
 
 Details that matter:
 
@@ -283,6 +283,13 @@ Details that matter:
   `eventN (deleted)`, and that is the string a client's libinput tries to open
   on the next grant (the backend resolves the fd through `/proc/self/fd`). The
   server's fd must therefore follow the node; the holders' dups need not.
+- **A resume requires the class, on either path**: a suspended entry waits for a
+  device of its OWN class, because the class is part of what the resource means —
+  `Keyboard(2)` handed a mouse gives its holder a device its name says it is not.
+  A device of another class on that node is a new device: the claim keeps its name
+  by moving off the node (a placeholder key, so `suspended_peer` still finds it by
+  class when its own device returns, wherever that is), and the newcomer is
+  adopted as a new resource.
 - **Index reuse**: an adopted device takes the lowest free index of its class, so
   a replug lands on the name it had before instead of shifting every later device.
 - **What wakes it**: an inotify watch on `/dev/input` — `IN_CREATE`,

@@ -254,8 +254,9 @@ async fn reconcile(
             Some(held) if current == Some((held.dev, held.ino)) => {}
 
             // The device is back at the node it had: its holder kept the
-            // resource while it was away, so it gets a fresh fd for this device.
-            Some(held) if held.suspended => {
+            // resource while it was away, so it gets a fresh fd for this device
+            // — provided it IS that device's class (see `may_resume`).
+            Some(held) if held.suspended && may_resume(&held, device.class) => {
                 if !resume(
                     registries,
                     index,
@@ -265,6 +266,34 @@ async fn reconcile(
                     &device.path,
                     &device.name,
                     &held,
+                )
+                .await
+                {
+                    retry = true;
+                }
+            }
+
+            // A device of another class took the node over. The suspended claim
+            // keeps its name and waits for its own device, and the newcomer is a
+            // new resource — never the name of a class it is not.
+            Some(held) if held.suspended => {
+                info!(
+                    "{} ({}) is a {:?}, not the device {:?} waits for: the claim keeps its name and this device is adopted",
+                    device.path.display(),
+                    device.name,
+                    device.class,
+                    held.resource
+                );
+                park(index, &device.path);
+                if !adopt(
+                    registries,
+                    index,
+                    advertised,
+                    engine,
+                    policy,
+                    &device.path,
+                    &device.name,
+                    device.class,
                 )
                 .await
                 {
@@ -287,10 +316,10 @@ async fn reconcile(
 
             // A different device under a name we already use. If the old device
             // is still there (an odd udev event) the holder's fd keeps working:
-            // only the server's fd moves to the current node. If it is gone,
-            // this is a device replaced inside one pass — the holder still owns
-            // the name and gets the new device's fd, exactly as if the daemon
-            // had seen the gap.
+            // only the server's fd moves to the current node. If it is gone, the
+            // device was replaced inside one pass — the holder keeps the name and
+            // gets the new device's fd, exactly as if the daemon had seen the
+            // gap, but only when the new device is of the same class.
             Some(held) => {
                 let replaced = held.device.as_ref().is_some_and(|device| device.exists());
                 if !replaced {
@@ -302,7 +331,7 @@ async fn reconcile(
                 }
                 let taken = if replaced {
                     reopen(registries, index, &device.path, &held.resource)
-                } else {
+                } else if may_resume(&held, device.class) {
                     resume(
                         registries,
                         index,
@@ -312,6 +341,23 @@ async fn reconcile(
                         &device.path,
                         &device.name,
                         &held,
+                    )
+                    .await
+                } else {
+                    // Another class took the node and the device this resource
+                    // held is gone: suspend it (its holder keeps the name, off
+                    // the node) and register the newcomer as a new resource.
+                    suspend(registries, index, advertised, engine, &device.path, &held).await;
+                    park(index, &device.path);
+                    adopt(
+                        registries,
+                        index,
+                        advertised,
+                        engine,
+                        policy,
+                        &device.path,
+                        &device.name,
+                        device.class,
                     )
                     .await
                 };
@@ -573,6 +619,28 @@ async fn push(advertised: &AdvertisedResources, engine: &PolicyEngine) {
         .await;
 }
 
+/// May this device be the one a held (suspended) resource is waiting for? Only
+/// a device of the resource's OWN class: the entry holds a name like
+/// `Keyboard(2)`, and its class is part of what the resource means to its
+/// holder — handing the name to a mouse gives that client a device its class
+/// says it is not. A device of another class on the node is a new device.
+fn may_resume(held: &HeldInput, class: InputClass) -> bool {
+    InputClass::of_resource(&held.resource) == Some(class)
+}
+
+/// Move a suspended entry off the devnode it used to sit on: the resource — and
+/// with it the holder's claim — is kept under a placeholder key, so the node is
+/// free for the device that took it over, and `suspended_peer` still finds the
+/// claim by class when the device it waits for comes back, on whatever node
+/// that is.
+fn park(index: &InputIndex, path: &Path) {
+    let Some((_, held)) = index.remove(path) else {
+        return;
+    };
+    let key = PathBuf::from(format!("<suspended>/{:?}", held.resource));
+    index.insert(key, held);
+}
+
 /// The lowest per-class index no held device uses. A replug therefore lands on
 /// the name its device had before, instead of shifting every other device.
 fn free_index(index: &InputIndex, class: InputClass) -> Option<u8> {
@@ -655,6 +723,32 @@ mod tests {
             "/dev/input/event3",
         );
         assert_eq!(free_index(&index, InputClass::Mouse), Some(1));
+    }
+
+    #[test]
+    fn a_suspended_resource_only_resumes_its_own_class() {
+        let index = new_index();
+        hold_as(
+            &index,
+            Resource::Input(InputResource::Keyboard(2)),
+            "/dev/input/event6",
+            true,
+        );
+        let held = index
+            .get(Path::new("/dev/input/event6"))
+            .expect("held")
+            .value()
+            .clone();
+
+        assert!(
+            may_resume(&held, InputClass::Keyboard),
+            "its own class resumes"
+        );
+        assert!(
+            !may_resume(&held, InputClass::Mouse),
+            "a mouse must not inherit Keyboard(2)"
+        );
+        assert!(!may_resume(&held, InputClass::Touch));
     }
 
     /// A suspended resource is one whose device has not come back: a device that
