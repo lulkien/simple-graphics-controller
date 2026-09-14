@@ -11,7 +11,7 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 - **Resource registries** — static fds for Fbdev/Input (grants are dups of these); DRM lease factories create fresh lease fds per grant; the server never closes the master fds
 
 ## Rust Best Practices (per rust-skills, applied to daemon)
-- [`own-borrow-over-clone`] — Grants are dups of the daemon's static fds; the canonical stays with the daemon; `fd()` lends dups (client owns the dup). See `resource_manager::query_resource` and `client_handler::wire`
+- [`own-borrow-over-clone`] — Grants are dups of the daemon's static fds; the canonical stays with the daemon; `fd()` lends dups (client owns the dup). See `resource_manager::open_resources` and `client_handler::wire`
 - [`own-arc-shared`] — `ResourceRegistry = Arc<DashMap<Resource, OwnedFd>>` shared across the server task and client tasks; `Arc` is justified because the registry is genuinely shared across threads (policy engine + multiple client connections)
 - [`own-refcell-interior`] — Not used in this crate (mutability handled via DashMap atomically; no single-threaded interior mutability needed); pattern to keep in mind for future refactors
 - [`own-cow-conditional`] — Use `Cow<'a, T>` for conditional ownership where appropriate (e.g. error messages that may or may not include context)
@@ -25,7 +25,7 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 - [`perf-iter-over-index`] — Prefer iterators over manual indexing; e.g. `advertised.iter()` over indexing into `advertised`; `registries.fds.keys().collect()`
 - [`num-nonzero`] — Use `NonZero*` types to forbid zero and unlock niche optimization; not currently in daemon but principle applies to resource indices / timeout values
 - [`api-from-not-into`] — Implement `From<T>`, not `Into<U>` — `SgcError::from` gives you `Into` for free; all fallible conversions use `From`
-- [`api-must-use`] — Mark types and functions with `#[must_use]` when ignoring results is likely a bug; e.g. `acquire` return value, `pump` result, `write_frame` result, `query_resource` result
+- [`api-must-use`] — Mark types and functions with `#[must_use]` when ignoring results is likely a bug; e.g. `acquire` return value, `pump` result, `write_frame` result, `open_resources` result
 - [`doc-all-public`] — Document all public items with `///` doc comments; all public types, functions, and modules have doc comments
 - [`doc-errors-section`] — Include `# Errors` section documenting all error variants; `SgcError` has `# Errors` doc section
 - [`doc-panics-section`] — Include `# Panics` section for functions that can panic under documented conditions; e.g. `expect()` documentation
@@ -44,7 +44,7 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 - `PolicyEngine` — spawned on one task (`PolicyEngine::spawn(policies)`); arbitrates all resource grants/denies/revokes; one global engine for all resources
 - `ResourceRegistry = Arc<DashMap<Resource, OwnedFd>>` — shared across server + client tasks; holds static fds for Fbdev/Input; DRM leases created per grant
 - `ResourceRegistries` — `fds: ResourceRegistry` (static fds) + `drm: DrmRegistry` (lease factories); cloned per client connection
-- `OpenedResources` — returned by `query_resource()`; registries + advertised order
+- `Inventory` — returned by `open_resources()`; registries + advertised order
 - `ClientId(u64)` — server-assigned monotonic identity for a connected client; keyed on connection not pid
 - `sgns_client_handler::wire` — wire protocol messages: `ControlMessage` (Revoke/Grant), `ClientMessage` (Acquire/Release/Ack)
 - `client_handler::control` — per-connection state: `ClientHandler` owns the stream, sessions, and resource borrows

@@ -54,7 +54,7 @@ boundary, never in the wire types.
 
 ```
 resource_manager/
-  mod.rs      ResourceRegistries, query_resource()
+  mod.rs      ResourceRegistries, open_resources()
   fbdev.rs    #[cfg(feature = "fbdev")]  open fbdev
   drm.rs      #[cfg(feature = "drm")]    DrmCard, DrmDevice, DrmRegistry
   input.rs    #[cfg(feature = "input")]  discovery + classification
@@ -72,7 +72,7 @@ pub struct ResourceRegistries {
 }
 ```
 
-`query_resource()` runs only the enabled openers and returns the registries
+`open_resources()` runs only the enabled openers and returns the registries
 plus the `advertised` list in priority order (first is best). The advertised
 list is the single source of truth for the engine's slots and the policy map
 — never registry keys.

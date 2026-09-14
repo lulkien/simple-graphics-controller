@@ -8,7 +8,7 @@
 //! Acquires against it with "not registered". The protocol crate is
 //! deliberately ungated (the wire format must not depend on the build).
 //!
-//! [`query_resource`] returns the advertised list in priority order:
+//! [`open_resources`] returns the advertised list in priority order:
 //! clients read it top-down, so the first entry of a kind is the best
 //! match (the first DRM card is the display card).
 
@@ -43,8 +43,9 @@ pub struct ResourceRegistries {
     pub drm: DrmRegistry,
 }
 
-/// Everything the server opened at startup.
-pub struct OpenedResources {
+/// Everything the daemon holds and offers: the registries it grants from,
+/// the list it advertises, and the input devices its reconciler tracks.
+pub struct Inventory {
     /// The registries the server grants from.
     pub registries: ResourceRegistries,
     /// Resources in advertised order (priority order — first is best).
@@ -60,7 +61,7 @@ pub struct OpenedResources {
 /// Returns the registries plus the resources in advertised order (priority
 /// order — first is best). Backends that are not compiled in contribute
 /// nothing.
-pub fn query_resource() -> OpenedResources {
+pub fn open_resources() -> Inventory {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     // With no backend features the list is never pushed to; the mut keeps
     // the body identical across all feature combinations.
@@ -82,7 +83,7 @@ pub fn query_resource() -> OpenedResources {
     #[cfg(feature = "input")]
     input::open_devices(resource_reg.clone(), &mut advertised, &input_index);
 
-    OpenedResources {
+    Inventory {
         registries: ResourceRegistries {
             fds: resource_reg,
             #[cfg(feature = "drm")]

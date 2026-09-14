@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(feature = "input")]
 use crate::resource_manager::hotplug;
 use crate::{
-    resource_manager::query_resource,
+    resource_manager::open_resources,
     types::AdvertisedResources,
     windowing::{Policy, PolicyEngine},
 };
@@ -35,10 +35,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting simple-graphics-controller");
-    let resources = query_resource();
+    let inventory = open_resources();
     // Advertised list: shared and mutable, because the input reconciler adds
     // and drops resources as devices come and go.
-    let advertised = Arc::new(AdvertisedResources::new(resources.advertised));
+    let advertised = Arc::new(AdvertisedResources::new(inventory.advertised));
     debug!(
         "Advertised resources (priority order): {:?}",
         advertised.snapshot()
@@ -67,8 +67,8 @@ async fn main() -> anyhow::Result<()> {
     // adopted later are offered to the engine with the same policy.
     #[cfg(feature = "input")]
     tokio::spawn(hotplug::run(
-        resources.registries.clone(),
-        resources.input_index.clone(),
+        inventory.registries.clone(),
+        inventory.input_index.clone(),
         advertised.clone(),
         engine.clone(),
         policy,
@@ -76,5 +76,5 @@ async fn main() -> anyhow::Result<()> {
 
     // `resources` (with the DRM masters inside registries.drm) stays alive
     // for the whole run: closing a master destroys its leases.
-    server::run(engine, resources.registries, advertised).await
+    server::run(engine, inventory.registries, advertised).await
 }
