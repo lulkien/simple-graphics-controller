@@ -17,7 +17,7 @@ use evdev::{AbsoluteAxisType, Device as EvdevDevice, Key, RelativeAxisType};
 use simple_graphics_protocol::{InputResource, Resource};
 use tracing::{debug, error, info};
 
-use crate::types::ResourceRegistry;
+use super::Holdings;
 
 /// One discovered input device, ready to be opened and registered.
 pub struct DiscoveredDevice {
@@ -105,11 +105,7 @@ pub fn new_index() -> InputIndex {
 /// Open and register every input device the discovery [`discover`] found.
 /// Each registry fd is the server's own open; grants dup it (the client
 /// parses evdev events straight off the dup — no path needed).
-pub(super) fn open_devices(
-    resource_reg: ResourceRegistry,
-    advertised: &mut Vec<Resource>,
-    index: &InputIndex,
-) {
+pub(super) fn open_devices(holdings: &Holdings, advertised: &mut Vec<Resource>) {
     for device in discover() {
         let Some((fd, dev, ino)) = open_device(&device.path) else {
             continue;
@@ -117,9 +113,9 @@ pub(super) fn open_devices(
 
         let resource = Resource::Input(device.resource);
         let raw = fd.as_raw_fd();
-        resource_reg.insert(resource.clone(), fd);
+        holdings.fds.insert(resource.clone(), fd);
         advertised.push(resource.clone());
-        index.insert(
+        holdings.inputs.insert(
             device.path.clone(),
             HeldInput {
                 resource: resource.clone(),

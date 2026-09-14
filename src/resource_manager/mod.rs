@@ -30,32 +30,105 @@ use simple_graphics_protocol::Resource;
 
 use crate::types::{AdvertisedResources, ResourceRegistry};
 
+use std::os::fd::OwnedFd;
+
 #[cfg(feature = "drm")]
 pub use drm::DrmRegistry;
 #[cfg(feature = "input")]
 pub use input::InputIndex;
 
-/// The server's grant sources, cloned per client connection.
+/// Everything the daemon holds: the grant sources, and the input devices it
+/// tracks so the reconciler can tell the node it opened from one re-created
+/// under the same path.
+///
+/// Cloned per client connection (every field is a shared handle, so the clone is
+/// cheap). The fields are private and every mutation goes through a method —
+/// the grant side here, the input transitions in [`hotplug`] beside the
+/// reconciler that calls them — because the order in which the fd table and the
+/// input index move is what keeps them consistent. See
+/// `docs/resource-manager.md`, "The invariants between them".
 #[derive(Clone)]
-pub struct ResourceRegistries {
+pub struct Holdings {
     /// Static fds for `Fbdev` and `Input` (grants are dups of these).
-    pub fds: ResourceRegistry,
+    fds: ResourceRegistry,
     /// DRM lease factories: each grant creates a fresh lease fd.
     #[cfg(feature = "drm")]
-    pub drm: DrmRegistry,
+    drm: DrmRegistry,
+    /// The held input devices, keyed by devnode path.
+    #[cfg(feature = "input")]
+    inputs: InputIndex,
 }
 
-/// Everything the daemon holds and offers: the registries it grants from,
-/// the list it advertises, and the input devices its reconciler tracks.
+impl Holdings {
+    /// The grant sources, with no input devices behind them. The daemon always
+    /// goes through `open_resources()`; this is how a test builds a server's
+    /// holdings.
+    #[cfg(test)]
+    #[cfg(feature = "drm")]
+    pub(crate) fn new(fds: ResourceRegistry, drm: DrmRegistry) -> Self {
+        Self {
+            fds,
+            drm,
+            #[cfg(feature = "input")]
+            inputs: input::new_index(),
+        }
+    }
+
+    /// The grant sources for a build without DRM.
+    #[cfg(test)]
+    #[cfg(not(feature = "drm"))]
+    pub(crate) fn new(fds: ResourceRegistry) -> Self {
+        Self {
+            fds,
+            #[cfg(feature = "input")]
+            inputs: input::new_index(),
+        }
+    }
+
+    /// The fd to grant for one resource: a fresh lease for `Drm`, otherwise a
+    /// dup of the registered fd.
+    pub fn grant_fd(&self, resource: &Resource) -> anyhow::Result<OwnedFd> {
+        match resource {
+            #[cfg(feature = "drm")]
+            Resource::Drm { .. } => {
+                let device = self
+                    .drm
+                    .get(resource)
+                    .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?;
+                device
+                    .grant_lease()
+                    .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}"))
+            }
+            _ => self
+                .fds
+                .get(resource)
+                .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("failed to dup fd for {resource:?}: {e}")),
+        }
+    }
+
+    /// Give up a `Drm` lease now, so the resource is free for the next grant
+    /// whatever the client does with the fd it was handed.
+    pub fn revoke_lease(&self, resource: &Resource) {
+        #[cfg(feature = "drm")]
+        if matches!(resource, Resource::Drm { .. })
+            && let Some(device) = self.drm.get(resource)
+        {
+            device.revoke_lease();
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = resource;
+    }
+}
+
+/// What `open_resources()` produced: the devices the daemon holds, and the
+/// list it advertises in priority order (first is best).
 pub struct Inventory {
-    /// The registries the server grants from.
-    pub registries: ResourceRegistries,
+    /// The devices the daemon holds and grants from.
+    pub holdings: Holdings,
     /// Resources in advertised order (priority order — first is best).
     pub advertised: Vec<Resource>,
-    /// The input devices the server holds, so the hot-plug reconciler can tell
-    /// the node it opened apart from one re-created under the same path.
-    #[cfg(feature = "input")]
-    pub input_index: InputIndex,
 }
 
 /// Open and register every available resource.
@@ -70,30 +143,31 @@ pub fn open_resources() -> Inventory {
     #[allow(unused_mut)]
     let mut advertised = Vec::new();
 
-    #[cfg(feature = "input")]
-    let input_index = input::new_index();
-
-    #[cfg(feature = "fbdev")]
-    fbdev::open(resource_reg.clone(), &mut advertised);
-
     #[cfg(feature = "drm")]
     let drm_registry: DrmRegistry = Arc::new(DashMap::new());
 
+    // One value the backends register into, so no backend can hold a grant
+    // source without the input index that goes with it.
+    let holdings = Holdings {
+        fds: resource_reg.clone(),
+        #[cfg(feature = "drm")]
+        drm: drm_registry,
+        #[cfg(feature = "input")]
+        inputs: input::new_index(),
+    };
+
+    #[cfg(feature = "fbdev")]
+    fbdev::open(&holdings, &mut advertised);
+
     #[cfg(feature = "drm")]
-    drm::open_devices(drm_registry.clone(), &mut advertised);
+    drm::open_devices(&holdings, &mut advertised);
 
     #[cfg(feature = "input")]
-    input::open_devices(resource_reg.clone(), &mut advertised, &input_index);
+    input::open_devices(&holdings, &mut advertised);
 
     Inventory {
-        registries: ResourceRegistries {
-            fds: resource_reg,
-            #[cfg(feature = "drm")]
-            drm: drm_registry,
-        },
+        holdings,
         advertised,
-        #[cfg(feature = "input")]
-        input_index,
     }
 }
 
@@ -101,8 +175,8 @@ pub fn open_resources() -> Inventory {
 /// violation, empty when the state is coherent.
 ///
 /// These are the rules the module maintains by hand today, and the reason the
-/// transitions (suspend / resume / adopt) belong behind methods: a violation
-/// means some path updated one structure without the others.
+/// transitions (suspend / resume / adopt) live behind `Holdings` methods: a
+/// violation means some path updated one structure without the others.
 ///
 /// 1. one index entry per resource, keyed by the devnode it sits on;
 /// 2. a LIVE entry (not suspended) is advertised, and its resource has an fd to

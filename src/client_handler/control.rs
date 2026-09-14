@@ -3,7 +3,7 @@
 
 use crate::{
     error::{ServerError, ServerResult},
-    resource_manager::ResourceRegistries,
+    resource_manager::Holdings,
     types::ClientId,
     windowing::{ControlMessage, PolicyEngine},
 };
@@ -21,7 +21,7 @@ pub(super) async fn process_control_message(
     client_pid: pid_t,
     engine: &PolicyEngine,
     msg: ControlMessage,
-    registries: &ResourceRegistries,
+    holdings: &Holdings,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     match msg {
@@ -61,7 +61,7 @@ pub(super) async fn process_control_message(
             // can be served, reply Deny, and keep the connection alive — a
             // failed grant is a resource problem, not a protocol error.
             if let Err(e) =
-                send_grant(stream, client_id, client_pid, resource.clone(), registries).await
+                send_grant(stream, client_id, client_pid, resource.clone(), holdings).await
             {
                 warn!("[client {client_id}] grant failed for {resource:?}: {e}");
                 engine.release(client_id, resource.clone()).await;

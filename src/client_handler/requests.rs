@@ -2,11 +2,11 @@
 //! stay silent for a queue), Release (forward to the engine), Ack (clear
 //! the grant-ack timer).
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
 use crate::{
     error::{ServerError, ServerResult},
-    resource_manager::ResourceRegistries,
+    resource_manager::Holdings,
     types::ClientId,
     windowing::{AcquireOutcome, PolicyEngine},
 };
@@ -25,7 +25,7 @@ pub(super) async fn dispatch_request(
     client_id: ClientId,
     client_pid: pid_t,
     engine: &PolicyEngine,
-    registries: &ResourceRegistries,
+    holdings: &Holdings,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     match req {
@@ -36,13 +36,13 @@ pub(super) async fn dispatch_request(
                 client_pid,
                 resource,
                 engine,
-                registries,
+                holdings,
                 ack_deadline,
             )
             .await?;
         }
         ClientRequest::Release { resource } => {
-            handle_release(client_id, resource, engine, registries).await;
+            handle_release(client_id, resource, engine, holdings).await;
         }
         ClientRequest::Ack => {
             info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
@@ -62,7 +62,7 @@ pub(super) async fn handle_acquire(
     client_pid: pid_t,
     resource: Resource,
     engine: &PolicyEngine,
-    registries: &ResourceRegistries,
+    holdings: &Holdings,
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] Acquire: {resource:?}");
@@ -75,7 +75,7 @@ pub(super) async fn handle_acquire(
             // ownership back so the next waiter can be served, reply Deny,
             // and keep the connection alive.
             if let Err(e) =
-                send_grant(stream, client_id, client_pid, resource.clone(), registries).await
+                send_grant(stream, client_id, client_pid, resource.clone(), holdings).await
             {
                 warn!("[client {client_id} (pid {client_pid})] Grant failed for {resource:?}: {e}");
                 engine.release(client_id, resource.clone()).await;
@@ -113,13 +113,13 @@ pub(super) async fn send_grant(
     client_id: ClientId,
     client_pid: pid_t,
     resource: Resource,
-    registries: &ResourceRegistries,
+    holdings: &Holdings,
 ) -> ServerResult<()> {
     // The granted fd must stay open until AFTER send_with_fd: SCM_RIGHTS
     // dups the fd at send time, and sending a number whose fd was already
     // closed fails with EBADF. Binding it here (not inside the match arm)
     // keeps it alive across the send.
-    let granted = grant_fd(&resource, registries)?;
+    let granted = holdings.grant_fd(&resource)?;
     let fd = granted.as_raw_fd();
 
     info!("[client {client_id} (pid {client_pid})] Granted {resource:?} (fd {fd})");
@@ -128,29 +128,6 @@ pub(super) async fn send_grant(
         .send_with_fd(&response, &[fd])
         .map_err(ServerError::Write)?;
     Ok(())
-}
-
-/// The fd to grant for one resource: a fresh lease for `Drm`, otherwise a
-/// dup of the server's registered fd.
-fn grant_fd(resource: &Resource, registries: &ResourceRegistries) -> anyhow::Result<OwnedFd> {
-    match resource {
-        #[cfg(feature = "drm")]
-        Resource::Drm { .. } => {
-            let device = registries
-                .drm
-                .get(resource)
-                .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?;
-            device
-                .grant_lease()
-                .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}"))
-        }
-        _ => registries
-            .fds
-            .get(resource)
-            .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
-            .try_clone()
-            .map_err(|e| anyhow::anyhow!("failed to dup fd for {resource:?}: {e}")),
-    }
 }
 
 /// Forward a Release to the engine. The engine validates ownership (a
@@ -162,15 +139,8 @@ pub(super) async fn handle_release(
     client_id: ClientId,
     resource: Resource,
     engine: &PolicyEngine,
-    registries: &ResourceRegistries,
+    holdings: &Holdings,
 ) {
-    #[cfg(feature = "drm")]
-    if matches!(resource, Resource::Drm { .. })
-        && let Some(device) = registries.drm.get(&resource)
-    {
-        device.revoke_lease();
-    }
-    #[cfg(not(feature = "drm"))]
-    let _ = &registries;
+    holdings.revoke_lease(&resource);
     engine.release(client_id, resource).await;
 }

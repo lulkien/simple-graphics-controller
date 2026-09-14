@@ -54,28 +54,34 @@ boundary, never in the wire types.
 
 ```
 resource_manager/
-  mod.rs      ResourceRegistries, open_resources()
+  mod.rs      Holdings, Inventory, open_resources()
   fbdev.rs    #[cfg(feature = "fbdev")]  open fbdev
   drm.rs      #[cfg(feature = "drm")]    DrmCard, DrmDevice, DrmRegistry
   input.rs    #[cfg(feature = "input")]  discovery + classification
 ```
 
 ```rust
-/// The server's grant sources, cloned per client connection.
+/// Everything the daemon holds. Fields private: every mutation goes through a
+/// method, because the order in which the fd table and the input index move is
+/// what keeps them consistent.
 #[derive(Clone)]
-pub struct ResourceRegistries {
-    /// Static fds for Fbdev and Input — grants are dups of these.
-    pub fds: ResourceRegistry,
-    /// DRM lease factories — each grant creates a fresh lease fd.
+pub struct Holdings {
+    fds: ResourceRegistry,          // static fds — grants are dups of these
     #[cfg(feature = "drm")]
-    pub drm: DrmRegistry,
+    drm: DrmRegistry,               // lease factories — a fresh lease per grant
+    #[cfg(feature = "input")]
+    inputs: InputIndex,             // the held input devices, by devnode
 }
 ```
 
-`open_resources()` runs only the enabled openers and returns the registries
-plus the `advertised` list in priority order (first is best). The advertised
-list is the single source of truth for the engine's slots and the policy map
-— never registry keys.
+`open_resources()` runs only the enabled openers and returns an `Inventory`:
+the `Holdings` it opened, plus the `advertised` list in priority order (first
+is best). The advertised list is the single source of truth for the engine's
+slots and the policy map — never registry keys.
+
+`Holdings` also carries the grant side of the request path (`grant_fd`,
+`revoke_lease`), and the input transitions live in `impl Holdings` in
+`hotplug.rs`, next to the reconciler that calls them.
 
 ## What owns what
 
@@ -85,8 +91,8 @@ fact has exactly one owner:
 | structure | owns | keyed by |
 | --- | --- | --- |
 | `PolicyEngine` | ownership and arbitration — who holds what, what is queued, what is suspended *to other clients* | `Resource` |
-| `ResourceRegistries.fds` | the grant *source* for Fbdev and Input: one canonical fd per resource, duplicated on grant | `Resource` |
-| `ResourceRegistries.drm` | the grant *source* for DRM: one lease factory per card, a fresh kernel lease per grant | `Resource` |
+| `Holdings.fds` | the grant *source* for Fbdev and Input: one canonical fd per resource, duplicated on grant | `Resource` |
+| `Holdings.drm` | the grant *source* for DRM: one lease factory per card, a fresh kernel lease per grant | `Resource` |
 | `InputIndex` | device identity (`dev`, `ino`, sysfs) and whether the devnode we opened is still ours | devnode path |
 | `AdvertisedResources` | a *derived view* — what the daemon offers, in priority order | — |
 

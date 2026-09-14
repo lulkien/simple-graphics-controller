@@ -49,7 +49,7 @@ use tracing::{debug, error, info, warn};
 
 use super::input::{self, HeldInput, InputClass, InputIndex};
 use crate::{
-    resource_manager::ResourceRegistries,
+    resource_manager::Holdings,
     types::AdvertisedResources,
     windowing::{ControlMessage, Policy, PolicyEngine},
 };
@@ -87,8 +87,7 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 /// ends. `policy` is the server's windowing policy (`SGC_POLICY`), applied to
 /// every device adopted later exactly as it was to the ones opened at startup.
 pub async fn run(
-    registries: ResourceRegistries,
-    index: InputIndex,
+    holdings: Holdings,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
@@ -101,22 +100,21 @@ pub async fn run(
             info!(
                 "Watching {WATCH_DIR} for device changes (safety pass every {SAFETY_INTERVAL:?})"
             );
-            run_watched(registries, index, advertised, engine, policy, watch).await;
+            run_watched(holdings, advertised, engine, policy, watch).await;
         }
         Err(e) => {
             warn!(
                 "Cannot watch {WATCH_DIR} ({e}); polling every {FALLBACK_INTERVAL:?} instead \
                  (a device that appears will still be adopted)"
             );
-            run_polling(registries, index, advertised, engine, policy).await;
+            run_polling(holdings, advertised, engine, policy).await;
         }
     }
 }
 
 /// Event-driven: reconcile when `/dev/input` changes, plus the backstop pass.
 async fn run_watched(
-    registries: ResourceRegistries,
-    index: InputIndex,
+    holdings: Holdings,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
@@ -133,7 +131,7 @@ async fn run_watched(
                     warn!(
                         "Input watch failed ({e}); polling every {FALLBACK_INTERVAL:?} from now on"
                     );
-                    return run_polling(registries, index, advertised, engine, policy).await;
+                    return run_polling(holdings, advertised, engine, policy).await;
                 }
                 "device change"
             }
@@ -143,7 +141,7 @@ async fn run_watched(
 
         let mut attempt = 0;
         loop {
-            let retry = reconcile(&registries, &index, &advertised, &engine, policy).await;
+            let retry = reconcile(&holdings, &advertised, &engine, policy).await;
             attempt += 1;
             if !retry || attempt >= MAX_RETRIES {
                 if retry {
@@ -161,15 +159,14 @@ async fn run_watched(
 
 /// The fallback: the same pass on a timer, used when there is nothing to watch.
 async fn run_polling(
-    registries: ResourceRegistries,
-    index: InputIndex,
+    holdings: Holdings,
     advertised: Arc<AdvertisedResources>,
     engine: PolicyEngine,
     policy: Policy,
 ) {
     loop {
         tokio::time::sleep(FALLBACK_INTERVAL).await;
-        reconcile(&registries, &index, &advertised, &engine, policy).await;
+        reconcile(&holdings, &advertised, &engine, policy).await;
     }
 }
 
@@ -234,8 +231,7 @@ impl Watch {
 /// (udev is still setting it up): the caller retries shortly, because with an
 /// event-driven wake there may be no next pass for a while.
 async fn reconcile(
-    registries: &ResourceRegistries,
-    index: &InputIndex,
+    holdings: &Holdings,
     advertised: &AdvertisedResources,
     engine: &PolicyEngine,
     policy: Policy,
@@ -247,7 +243,10 @@ async fn reconcile(
     for device in probed {
         present.push(device.path.clone());
         let current = input::path_identity(&device.path);
-        let held = index.get(&device.path).map(|entry| entry.value().clone());
+        let held = holdings
+            .inputs
+            .get(&device.path)
+            .map(|entry| entry.value().clone());
         match held {
             // Ours, and the node is the same inode: nothing to do — this is
             // every device on every pass.
@@ -257,17 +256,16 @@ async fn reconcile(
             // resource while it was away, so it gets a fresh fd for this device
             // — provided it IS that device's class (see `may_resume`).
             Some(held) if held.suspended && may_resume(&held, device.class) => {
-                if !resume(
-                    registries,
-                    index,
-                    advertised,
-                    engine,
-                    &device.path,
-                    &device.path,
-                    &device.name,
-                    &held,
-                )
-                .await
+                if !holdings
+                    .resume(
+                        advertised,
+                        engine,
+                        &device.path,
+                        &device.path,
+                        &device.name,
+                        &held,
+                    )
+                    .await
                 {
                     retry = true;
                 }
@@ -284,18 +282,17 @@ async fn reconcile(
                     device.class,
                     held.resource
                 );
-                park(index, &device.path);
-                if !adopt(
-                    registries,
-                    index,
-                    advertised,
-                    engine,
-                    policy,
-                    &device.path,
-                    &device.name,
-                    device.class,
-                )
-                .await
+                park(&holdings.inputs, &device.path);
+                if !holdings
+                    .adopt(
+                        advertised,
+                        engine,
+                        policy,
+                        &device.path,
+                        &device.name,
+                        device.class,
+                    )
+                    .await
                 {
                     retry = true;
                 }
@@ -309,7 +306,7 @@ async fn reconcile(
             // resolves to "eventN (deleted)", which the next client's libinput
             // refuses.
             Some(held) if same_device(&device.path, &held) => {
-                if !reopen(registries, index, &device.path, &held.resource) {
+                if !holdings.reopen(&device.path, &held.resource) {
                     retry = true;
                 }
             }
@@ -330,36 +327,36 @@ async fn reconcile(
                     );
                 }
                 let taken = if replaced {
-                    reopen(registries, index, &device.path, &held.resource)
+                    holdings.reopen(&device.path, &held.resource)
                 } else if may_resume(&held, device.class) {
-                    resume(
-                        registries,
-                        index,
-                        advertised,
-                        engine,
-                        &device.path,
-                        &device.path,
-                        &device.name,
-                        &held,
-                    )
-                    .await
+                    holdings
+                        .resume(
+                            advertised,
+                            engine,
+                            &device.path,
+                            &device.path,
+                            &device.name,
+                            &held,
+                        )
+                        .await
                 } else {
                     // Another class took the node and the device this resource
                     // held is gone: suspend it (its holder keeps the name, off
                     // the node) and register the newcomer as a new resource.
-                    suspend(registries, index, advertised, engine, &device.path, &held).await;
-                    park(index, &device.path);
-                    adopt(
-                        registries,
-                        index,
-                        advertised,
-                        engine,
-                        policy,
-                        &device.path,
-                        &device.name,
-                        device.class,
-                    )
-                    .await
+                    holdings
+                        .suspend(advertised, engine, &device.path, &held)
+                        .await;
+                    park(&holdings.inputs, &device.path);
+                    holdings
+                        .adopt(
+                            advertised,
+                            engine,
+                            policy,
+                            &device.path,
+                            &device.name,
+                            device.class,
+                        )
+                        .await
                 };
                 if !taken {
                     retry = true;
@@ -370,7 +367,7 @@ async fn reconcile(
             // waiting for. A device that comes back on a DIFFERENT node (a replug
             // into another port) still belongs to the client that held that name:
             // it asked for "the mouse", not for a specific devnode.
-            None => match suspended_peer(index, device.class) {
+            None => match suspended_peer(&holdings.inputs, device.class) {
                 Some((old_path, held)) => {
                     info!(
                         "{} ({}) takes over {:?} from {}: the device is back on another node",
@@ -379,33 +376,31 @@ async fn reconcile(
                         held.resource,
                         old_path.display()
                     );
-                    if !resume(
-                        registries,
-                        index,
-                        advertised,
-                        engine,
-                        &old_path,
-                        &device.path,
-                        &device.name,
-                        &held,
-                    )
-                    .await
+                    if !holdings
+                        .resume(
+                            advertised,
+                            engine,
+                            &old_path,
+                            &device.path,
+                            &device.name,
+                            &held,
+                        )
+                        .await
                     {
                         retry = true;
                     }
                 }
                 None => {
-                    if !adopt(
-                        registries,
-                        index,
-                        advertised,
-                        engine,
-                        policy,
-                        &device.path,
-                        &device.name,
-                        device.class,
-                    )
-                    .await
+                    if !holdings
+                        .adopt(
+                            advertised,
+                            engine,
+                            policy,
+                            &device.path,
+                            &device.name,
+                            device.class,
+                        )
+                        .await
                     {
                         retry = true;
                     }
@@ -415,7 +410,8 @@ async fn reconcile(
     }
 
     // Held devices whose node is not in `/dev/input` this pass.
-    let held: Vec<(PathBuf, HeldInput)> = index
+    let held: Vec<(PathBuf, HeldInput)> = holdings
+        .inputs
         .iter()
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
@@ -430,14 +426,14 @@ async fn reconcile(
         if held.device.as_ref().is_some_and(|device| device.exists()) {
             continue;
         }
-        suspend(registries, index, advertised, engine, &path, &held).await;
+        holdings.suspend(advertised, engine, &path, &held).await;
     }
 
     // The invariants this module maintains by hand, checked where they can
     // break. Debug builds only: a violation is a bug in the code above, not
     // something to take a board down over.
     #[cfg(debug_assertions)]
-    for problem in super::check_consistency(&registries.fds, index, advertised) {
+    for problem in super::check_consistency(&holdings.fds, &holdings.inputs, advertised) {
         error!("resource invariant violated: {problem}");
     }
 
@@ -454,166 +450,160 @@ fn same_device(path: &Path, held: &HeldInput) -> bool {
     }
 }
 
-/// Replace the server's fd for a device whose node was re-created: the resource
-/// keeps its name, its holder keeps the fd it has (it still works), and the NEXT
-/// grant opens the node as it exists now. `false` if the node would not open yet.
-fn reopen(
-    registries: &ResourceRegistries,
-    index: &InputIndex,
-    path: &Path,
-    resource: &Resource,
-) -> bool {
-    let Some((fd, dev, ino)) = input::open_device(path) else {
-        return false;
-    };
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    registries.fds.insert(resource.clone(), fd);
-    index.insert(
-        path.to_path_buf(),
-        HeldInput {
-            resource: resource.clone(),
-            dev,
-            ino,
-            device: input::device_identity(path),
-            suspended: false,
-        },
-    );
-    info!(
-        "{} was re-created for the same device; re-opened as {resource:?} (fd {raw}) for future grants \
+impl Holdings {
+    /// Replace the server's fd for a device whose node was re-created: the resource
+    /// keeps its name, its holder keeps the fd it has (it still works), and the NEXT
+    /// grant opens the node as it exists now. `false` if the node would not open yet.
+    fn reopen(&self, path: &Path, resource: &Resource) -> bool {
+        let Some((fd, dev, ino)) = input::open_device(path) else {
+            return false;
+        };
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        self.fds.insert(resource.clone(), fd);
+        self.inputs.insert(
+            path.to_path_buf(),
+            HeldInput {
+                resource: resource.clone(),
+                dev,
+                ino,
+                device: input::device_identity(path),
+                suspended: false,
+            },
+        );
+        info!(
+            "{} was re-created for the same device; re-opened as {resource:?} (fd {raw}) for future grants \
          — a current holder keeps the fd it has",
-        path.display()
-    );
-    true
-}
-
-/// Open a device and start offering it as an input resource.
-#[allow(clippy::too_many_arguments)]
-async fn adopt(
-    registries: &ResourceRegistries,
-    index: &InputIndex,
-    advertised: &AdvertisedResources,
-    engine: &PolicyEngine,
-    policy: Policy,
-    path: &Path,
-    name: &str,
-    class: InputClass,
-) -> bool {
-    let Some(index_in_class) = free_index(index, class) else {
-        error!(
-            "{}: every {class:?} index is taken; cannot register it",
             path.display()
         );
-        return false;
-    };
-    let input_resource = class.resource(index_in_class);
-    let resource = Resource::Input(input_resource);
-
-    // Open BEFORE registering: a device that cannot be opened yet (udev has
-    // not finished with it) is simply picked up on the next pass.
-    let Some((fd, dev, ino)) = input::open_device(path) else {
-        return false;
-    };
-
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    registries.fds.insert(resource.clone(), fd);
-    index.insert(
-        path.to_path_buf(),
-        HeldInput {
-            resource: resource.clone(),
-            dev,
-            ino,
-            device: input::device_identity(path),
-            suspended: false,
-        },
-    );
-    advertised.insert(resource.clone());
-    // Offer BEFORE pushing: a client that acts on the pushed list immediately
-    // asks for the resource, and that Acquire has to be accepted.
-    engine.offer(resource.clone(), policy).await;
-    info!(
-        "Opened {} ({name}): {resource:?} (fd {raw}, plugged in while running)",
-        path.display()
-    );
-    push(advertised, engine).await;
-    true
-}
-
-/// The device is gone. Nothing is revoked: the resource, and the client holding
-/// it, stay exactly as they are — only the resource leaves the advertised list
-/// (it cannot be granted while its device is away). The entry stays in the
-/// index, marked suspended, so the device that comes back resumes the same name
-/// instead of being adopted as something new.
-async fn suspend(
-    registries: &ResourceRegistries,
-    index: &InputIndex,
-    advertised: &AdvertisedResources,
-    engine: &PolicyEngine,
-    path: &Path,
-    held: &HeldInput,
-) {
-    advertised.remove(&held.resource);
-    engine.suspend(held.resource.clone()).await;
-    registries.fds.remove(&held.resource);
-    index.insert(
-        path.to_path_buf(),
-        HeldInput {
-            suspended: true,
-            ..held.clone()
-        },
-    );
-    warn!(
-        "Suspended {:?} ({}): the device is gone; its holder keeps it and is told when it is back",
-        held.resource,
-        path.display()
-    );
-    push(advertised, engine).await;
-}
-
-/// The device is back. Whoever held the resource still holds it — there is no
-/// re-acquire, and no window in which another client could take the name — so
-/// all that is left is to hand that client a fresh fd for the device that
-/// returned. `false` if the node would not open yet.
-///
-/// Order matters: the fd is registered BEFORE the engine re-grants, because the
-/// grant is a dup of that registry entry.
-#[allow(clippy::too_many_arguments)]
-async fn resume(
-    registries: &ResourceRegistries,
-    index: &InputIndex,
-    advertised: &AdvertisedResources,
-    engine: &PolicyEngine,
-    old_path: &Path,
-    path: &Path,
-    name: &str,
-    held: &HeldInput,
-) -> bool {
-    let resource = held.resource.clone();
-    let Some((fd, dev, ino)) = input::open_device(path) else {
-        return false;
-    };
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    registries.fds.insert(resource.clone(), fd);
-    if old_path != path {
-        index.remove(old_path);
+        true
     }
-    index.insert(
-        path.to_path_buf(),
-        HeldInput {
-            resource: resource.clone(),
-            dev,
-            ino,
-            device: input::device_identity(path),
-            suspended: false,
-        },
-    );
-    advertised.insert(resource.clone());
-    engine.resume(resource.clone()).await;
-    info!(
-        "Resumed {resource:?} ({} ({name}), fd {raw}): the device is back with its holder — no re-acquire",
-        path.display()
-    );
-    push(advertised, engine).await;
-    true
+
+    /// Open a device and start offering it as an input resource.
+    #[allow(clippy::too_many_arguments)]
+    async fn adopt(
+        &self,
+        advertised: &AdvertisedResources,
+        engine: &PolicyEngine,
+        policy: Policy,
+        path: &Path,
+        name: &str,
+        class: InputClass,
+    ) -> bool {
+        let Some(index_in_class) = free_index(&self.inputs, class) else {
+            error!(
+                "{}: every {class:?} index is taken; cannot register it",
+                path.display()
+            );
+            return false;
+        };
+        let input_resource = class.resource(index_in_class);
+        let resource = Resource::Input(input_resource);
+
+        // Open BEFORE registering: a device that cannot be opened yet (udev has
+        // not finished with it) is simply picked up on the next pass.
+        let Some((fd, dev, ino)) = input::open_device(path) else {
+            return false;
+        };
+
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        self.fds.insert(resource.clone(), fd);
+        self.inputs.insert(
+            path.to_path_buf(),
+            HeldInput {
+                resource: resource.clone(),
+                dev,
+                ino,
+                device: input::device_identity(path),
+                suspended: false,
+            },
+        );
+        advertised.insert(resource.clone());
+        // Offer BEFORE pushing: a client that acts on the pushed list immediately
+        // asks for the resource, and that Acquire has to be accepted.
+        engine.offer(resource.clone(), policy).await;
+        info!(
+            "Opened {} ({name}): {resource:?} (fd {raw}, plugged in while running)",
+            path.display()
+        );
+        push(advertised, engine).await;
+        true
+    }
+
+    /// The device is gone. Nothing is revoked: the resource, and the client holding
+    /// it, stay exactly as they are — only the resource leaves the advertised list
+    /// (it cannot be granted while its device is away). The entry stays in the
+    /// index, marked suspended, so the device that comes back resumes the same name
+    /// instead of being adopted as something new.
+    async fn suspend(
+        &self,
+        advertised: &AdvertisedResources,
+        engine: &PolicyEngine,
+        path: &Path,
+        held: &HeldInput,
+    ) {
+        advertised.remove(&held.resource);
+        engine.suspend(held.resource.clone()).await;
+        self.fds.remove(&held.resource);
+        self.inputs.insert(
+            path.to_path_buf(),
+            HeldInput {
+                suspended: true,
+                ..held.clone()
+            },
+        );
+        warn!(
+            "Suspended {:?} ({}): the device is gone; its holder keeps it and is told when it is back",
+            held.resource,
+            path.display()
+        );
+        push(advertised, engine).await;
+    }
+
+    /// The device is back. Whoever held the resource still holds it — there is no
+    /// re-acquire, and no window in which another client could take the name — so
+    /// all that is left is to hand that client a fresh fd for the device that
+    /// returned. `false` if the node would not open yet.
+    ///
+    /// Order matters: the fd is registered BEFORE the engine re-grants, because the
+    /// grant is a dup of that registry entry.
+    #[allow(clippy::too_many_arguments)]
+    async fn resume(
+        &self,
+        advertised: &AdvertisedResources,
+        engine: &PolicyEngine,
+        old_path: &Path,
+        path: &Path,
+        name: &str,
+        held: &HeldInput,
+    ) -> bool {
+        let resource = held.resource.clone();
+        let Some((fd, dev, ino)) = input::open_device(path) else {
+            return false;
+        };
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        self.fds.insert(resource.clone(), fd);
+        if old_path != path {
+            self.inputs.remove(old_path);
+        }
+        self.inputs.insert(
+            path.to_path_buf(),
+            HeldInput {
+                resource: resource.clone(),
+                dev,
+                ino,
+                device: input::device_identity(path),
+                suspended: false,
+            },
+        );
+        advertised.insert(resource.clone());
+        engine.resume(resource.clone()).await;
+        info!(
+            "Resumed {resource:?} ({} ({name}), fd {raw}): the device is back with its holder — no re-acquire",
+            path.display()
+        );
+        push(advertised, engine).await;
+        true
+    }
 }
 
 /// Tell every connected client what the server offers now. Without this, a
