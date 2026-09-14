@@ -257,8 +257,9 @@ machine never throws away the one handle that can still reclaim the objects.
 ## Input hot-plug — the reconciler
 
 fbdev and DRM cards are fixed by what the kernel exposes at boot; input devices
-are not. `resource_manager::hotplug` re-checks `/dev/input` every
-`RECONCILE_INTERVAL` (2 s) and makes the server match what it finds:
+are not. `resource_manager::hotplug` reconciles the server's devices with
+`/dev/input` — an inotify watch wakes it, a 60 s pass backstops it — and makes the
+server match what it finds:
 
 | observed | action |
 | --- | --- |
@@ -282,10 +283,25 @@ Details that matter:
   server's fd must therefore follow the node; the holders' dups need not.
 - **Index reuse**: an adopted device takes the lowest free index of its class, so
   a replug lands on the name it had before instead of shifting every later device.
-- **Why polling, not a udev monitor**: the `input` feature pulls `evdev` with
-  `default-features = false` to keep libudev out of the build, and udev's node
-  setup is asynchronous anyway (a device that is not ready yet is simply retried
-  on the next pass). The cost is a handful of opens every 2 s.
+- **What wakes it**: an inotify watch on `/dev/input` — `IN_CREATE`,
+  `IN_DELETE`, `IN_MOVED_TO`, and deliberately NOT `IN_ATTRIB`: udev chmods the
+  node right after the kernel creates it, and that carries no information the
+  reconciler acts on. The watch is installed before the first pass, so a device
+  that appears while the daemon starts is not missed. inotify is a syscall, so
+  there is nothing to add: the `input` feature already pulls `evdev` with
+  `default-features = false` to keep libudev out of the build, and the only user
+  is `nix` (a dependency already) behind its `inotify` feature. `AsyncFd` gives
+  the wake; nix's `Inotify` implements `AsFd` while `AsyncFd` wants `AsRawFd`, so
+  the fd is duped for readiness and events are read through the `Inotify` handle
+  (same queue).
+- **Why the backstop passes exist**: a burst is left to settle for 200 ms and
+  then reconciled once (a plug fires several events — the node, udev's chmod, a
+  trigger touching neighbours), but events can be missed: an overflowed queue, or
+  a watch that could not be installed at all (no `/dev/input` yet — the reconciler
+  then polls every 2 s, which is also its behaviour before the watch existed). A
+  stale view has nothing else to correct it, so a pass runs every 60 s
+  regardless. A node that is announced but not yet openable is retried after
+  500 ms (up to 5 times) rather than waiting for the next tick.
 - **Withdrawal is a revoke**: `PolicyEngine::withdraw` marks the slot so no new
   Acquire succeeds, drops its waiters, and tells the holder to leave on the usual
   handshake (5 s deadline, then force-reclaim). The slot is removed once nobody

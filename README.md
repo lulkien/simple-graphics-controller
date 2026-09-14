@@ -47,11 +47,12 @@ flowchart LR
 A build without a backend never advertises it, and `Acquire` against it is
 denied "not registered".
 
-Input is not a boot-time snapshot: the daemon re-checks `/dev/input` every
-couple of seconds, so a device plugged in while it runs is opened and advertised,
-and one that goes away is withdrawn (its holder is revoked). A device node that
-udev re-creates under it is re-opened for later grants without disturbing the
-client holding it. See [docs/resource-manager.md](docs/resource-manager.md).
+Input is not a boot-time snapshot: the daemon watches `/dev/input` and
+reconciles on every change, so a device plugged in while it runs is opened and
+advertised, and one that goes away is withdrawn (its holder is revoked). A device
+node that udev re-creates under it is re-opened for later grants without
+disturbing the client holding it. A safety pass every 60 s covers anything the
+watch cannot see. See [docs/resource-manager.md](docs/resource-manager.md).
 
 ## Limitations
 
