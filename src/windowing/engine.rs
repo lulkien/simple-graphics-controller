@@ -57,6 +57,10 @@ struct Slot {
     waiters: VecDeque<Waiter>,
     /// Set while a Revoke is in flight (awaiting the owner's Release).
     revoke_deadline: Option<Instant>,
+    /// Set when the resource leaves the server (its device is gone): no new
+    /// grants, no queue, and the slot itself is removed as soon as nobody
+    /// holds it.
+    withdrawn: bool,
 }
 
 impl Slot {
@@ -95,6 +99,18 @@ enum EngineCommand {
     },
     Disconnected {
         client: ClientId,
+    },
+    /// A resource appeared (a device was plugged in): add its slot with the
+    /// server's policy so it can be acquired from now on.
+    Offer {
+        resource: Resource,
+        policy: Policy,
+    },
+    /// A resource is gone (its device was removed or re-created): revoke the
+    /// holder if any, refuse further Acquires, and drop the slot once nobody
+    /// holds it.
+    Withdraw {
+        resource: Resource,
     },
 }
 
@@ -150,6 +166,23 @@ impl PolicyEngine {
     pub async fn disconnected(&self, client: ClientId) {
         let _ = self.tx.send(EngineCommand::Disconnected { client }).await;
     }
+
+    /// Start offering `resource`: its slot is created with `policy` so a
+    /// connecting client can acquire it. Idempotent — offering a resource that
+    /// already has a slot (a re-created device node) changes nothing.
+    pub async fn offer(&self, resource: Resource, policy: Policy) {
+        let _ = self
+            .tx
+            .send(EngineCommand::Offer { resource, policy })
+            .await;
+    }
+
+    /// Stop offering `resource`: revoke its holder if it has one, refuse
+    /// further Acquires, and forget the slot once it is free. Used when the
+    /// device behind it goes away.
+    pub async fn withdraw(&self, resource: Resource) {
+        let _ = self.tx.send(EngineCommand::Withdraw { resource }).await;
+    }
 }
 
 async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Resource, Policy>) {
@@ -163,6 +196,7 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
                     owner: None,
                     waiters: VecDeque::new(),
                     revoke_deadline: None,
+                    withdrawn: false,
                 },
             )
         })
@@ -182,6 +216,7 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
             Ok(None) => break, // all connection tasks gone; engine shuts down
             Err(_) => {
                 // Revoke deadline(s) elapsed: force-reclaim silent owners.
+                let mut forced: Vec<Resource> = Vec::new();
                 for (resource, slot) in slots.iter_mut() {
                     if let Some(deadline) = slot.revoke_deadline
                         && deadline <= Instant::now()
@@ -192,7 +227,13 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
                             slot.owner.map(|o| o.to_string()).unwrap_or_default()
                         );
                         force_reclaim(resource, slot, &control_reg);
+                        forced.push(resource.clone());
                     }
+                }
+                // A withdrawn resource whose owner just got reclaimed is done
+                // with too.
+                for resource in &forced {
+                    drop_withdrawn(resource, &mut slots);
                 }
             }
         }
@@ -212,6 +253,12 @@ fn acquire_one(
             reason: format!("{resource:?} is not registered"),
         };
     };
+
+    if slot.withdrawn {
+        return AcquireOutcome::Denied {
+            reason: format!("{resource:?} is no longer available (its device is gone)"),
+        };
+    }
 
     if slot.owner == Some(client) {
         return AcquireOutcome::Denied {
@@ -273,11 +320,11 @@ fn acquire_one(
 /// the resource to the next waiter.
 fn release_one(
     client: ClientId,
-    resource: Resource,
+    resource: &Resource,
     slots: &mut HashMap<Resource, Slot>,
     control_reg: &mut HashMap<ClientId, mpsc::UnboundedSender<ControlMessage>>,
 ) {
-    let Some(slot) = slots.get_mut(&resource) else {
+    let Some(slot) = slots.get_mut(resource) else {
         warn!("[client {client}] release of unregistered {resource:?} ignored");
         return;
     };
@@ -300,7 +347,20 @@ fn release_one(
         // the resource straight back to the releaser.
         info!("[client {client}] released {resource:?}");
     }
-    grant_next(&resource, slot, control_reg);
+    grant_next(resource, slot, control_reg);
+}
+
+/// Forget a withdrawn slot once nobody holds it: the device behind the
+/// resource is gone, and the slot must not survive to be silently revived by a
+/// later `Offer` of the same resource name.
+fn drop_withdrawn(resource: &Resource, slots: &mut HashMap<Resource, Slot>) {
+    if slots
+        .get(resource)
+        .is_some_and(|slot| slot.withdrawn && slot.owner.is_none())
+    {
+        slots.remove(resource);
+        debug!("{resource:?} is withdrawn and free: slot removed");
+    }
 }
 
 fn handle_command(
@@ -315,6 +375,7 @@ fn handle_command(
         }
         EngineCommand::Disconnected { client } => {
             control_reg.remove(&client);
+            let mut released: Vec<Resource> = Vec::new();
             for (resource, slot) in slots.iter_mut() {
                 let before = slot.waiters.len();
                 slot.waiters.retain(|w| w.client != client);
@@ -326,7 +387,12 @@ fn handle_command(
                     slot.owner = None;
                     slot.revoke_deadline = None;
                     grant_next(resource, slot, control_reg);
+                    released.push(resource.clone());
                 }
+            }
+            // A withdrawn resource whose owner just left is done with.
+            for resource in &released {
+                drop_withdrawn(resource, slots);
             }
         }
         EngineCommand::Acquire {
@@ -338,7 +404,62 @@ fn handle_command(
             let _ = reply.send(outcome);
         }
         EngineCommand::Release { client, resource } => {
-            release_one(client, resource, slots, control_reg);
+            release_one(client, &resource, slots, control_reg);
+            drop_withdrawn(&resource, slots);
+        }
+        EngineCommand::Offer { resource, policy } => {
+            // Idempotent: a re-created device node keeps its slot (and with it
+            // any waiter that is still queued for the name).
+            if slots.contains_key(&resource) {
+                debug!("{resource:?} offered again; slot kept");
+                return;
+            }
+            slots.insert(
+                resource.clone(),
+                Slot {
+                    policy,
+                    owner: None,
+                    waiters: VecDeque::new(),
+                    revoke_deadline: None,
+                    withdrawn: false,
+                },
+            );
+            info!("Offering {resource:?} ({policy:?})");
+        }
+        EngineCommand::Withdraw { resource } => {
+            let Some(slot) = slots.get_mut(&resource) else {
+                debug!("Withdraw of unregistered {resource:?} ignored");
+                return;
+            };
+            slot.withdrawn = true;
+            // The device is gone: a queued Grant can never be honoured, and the
+            // protocol has no async "cancelled" reply, so drop the queue (the
+            // waiters were already answered `Queued` and will simply never hear
+            // back).
+            let queued = slot.waiters.len();
+            slot.waiters.clear();
+            match slot.owner {
+                Some(owner) => {
+                    // Same handshake as a preemption: ask, then force.
+                    if let Some(control) = control_reg.get(&owner) {
+                        let _ = control.send(ControlMessage::Revoke {
+                            resource: resource.clone(),
+                        });
+                        slot.revoke_deadline = Some(Instant::now() + REVOKE_TIMEOUT);
+                    } else {
+                        slot.owner = None;
+                        slot.revoke_deadline = None;
+                    }
+                    warn!(
+                        "Withdrawing {resource:?}: Revoke sent to client {owner} \
+                         ({queued} waiter(s) dropped)"
+                    );
+                }
+                None => {
+                    warn!("Withdrawing {resource:?} ({queued} waiter(s) dropped)");
+                    slots.remove(&resource);
+                }
+            }
         }
     }
 }
@@ -397,12 +518,16 @@ fn force_reclaim(
 #[cfg(test)]
 mod engine_tests {
     use super::*;
-    use simple_graphics_protocol::Resource;
+    use simple_graphics_protocol::{InputResource, Resource};
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
     fn fbdev() -> Resource {
         Resource::Fbdev
+    }
+
+    fn keyboard() -> Resource {
+        Resource::Input(InputResource::Keyboard(0))
     }
 
     fn cid(n: u64) -> ClientId {
@@ -630,5 +755,91 @@ mod engine_tests {
         tokio::time::advance(REVOKE_TIMEOUT + Duration::from_secs(1)).await;
         let msg = poll_control(&mut b).await;
         assert!(matches!(msg, ControlMessage::Grant { .. }));
+    }
+
+    #[tokio::test]
+    async fn offered_resource_becomes_acquirable() {
+        let engine = engine(Policy::FairQueue);
+        let mut a = connect(&engine, 1).await;
+        let keyboard = keyboard();
+
+        // Nothing registered it yet.
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Denied { .. }
+        ));
+
+        engine.offer(keyboard.clone(), Policy::FairQueue).await;
+        // Offering twice is what a re-created device node looks like: the slot
+        // is kept, not duplicated.
+        engine.offer(keyboard.clone(), Policy::FairQueue).await;
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+        // The immediate grant goes out on the client's own wire write.
+        assert!(a.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn withdrawn_resource_revokes_holder_and_is_forgotten() {
+        let engine = engine(Policy::FairQueue);
+        let mut a = connect(&engine, 1).await;
+        let keyboard = keyboard();
+
+        engine.offer(keyboard.clone(), Policy::FairQueue).await;
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Granted
+        ));
+
+        // The device goes away: its holder is asked to leave.
+        engine.withdraw(keyboard.clone()).await;
+        assert!(matches!(
+            next_control(&mut a).await,
+            ControlMessage::Revoke { resource } if resource == keyboard
+        ));
+        // And nobody new can take it in the meantime.
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Denied { reason } if reason.contains("no longer available")
+        ));
+
+        // The revoke-ack Release retires the slot: the resource is gone, not
+        // merely unowned.
+        engine.release(cid(1), keyboard.clone()).await;
+        assert!(matches!(
+            engine.acquire(cid(1), keyboard.clone()).await,
+            AcquireOutcome::Denied { reason } if reason.contains("not registered")
+        ));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_resource_drops_its_queue() {
+        let engine = engine(Policy::FairQueue);
+        let mut a = connect(&engine, 1).await;
+        let mut b = connect(&engine, 2).await;
+        let mut c = connect(&engine, 3).await;
+        let keyboard = keyboard();
+
+        engine.offer(keyboard.clone(), Policy::FairQueue).await;
+        engine.acquire(cid(1), keyboard.clone()).await; // granted
+        assert!(matches!(
+            engine.acquire(cid(2), keyboard.clone()).await,
+            AcquireOutcome::Queued
+        ));
+        let _ = next_control(&mut a).await; // Revoke, for B
+
+        // The device is gone while B is still queued for it: B can never be
+        // granted it, so it is dropped rather than left believing a Grant is
+        // still coming.
+        engine.withdraw(keyboard.clone()).await;
+        assert!(matches!(
+            engine.acquire(cid(3), keyboard.clone()).await,
+            AcquireOutcome::Denied { reason } if reason.contains("no longer available")
+        ));
+        engine.release(cid(1), keyboard.clone()).await;
+        assert!(b.try_recv().is_err());
+        assert!(c.try_recv().is_err());
     }
 }

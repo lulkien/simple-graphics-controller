@@ -13,10 +13,10 @@ use std::{sync::Arc, time::Duration};
 
 use crate::error::{ServerError, ServerResult};
 use crate::resource_manager::ResourceRegistries;
-use crate::types::ClientId;
+use crate::types::{AdvertisedResources, ClientId};
 use crate::windowing::PolicyEngine;
 use nix::libc::pid_t;
-use simple_graphics_protocol::{Resource, ServerMessage, serialize_framed};
+use simple_graphics_protocol::{ServerMessage, serialize_framed};
 use tokio::{io::AsyncWriteExt, net::UnixStream, sync::mpsc, time::Instant};
 use tracing::{debug, info, warn};
 
@@ -31,7 +31,7 @@ pub async fn handle_connection(
     client_pid: pid_t,
     engine: PolicyEngine,
     registries: ResourceRegistries,
-    advertised: Arc<Vec<Resource>>,
+    advertised: Arc<AdvertisedResources>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] New client connected");
 
@@ -42,7 +42,7 @@ pub async fn handle_connection(
 
     // Send available resources immediately (no Hello handshake needed). The
     // list carries the discovery priority order — first is best.
-    let available_resources = advertised.as_ref().clone();
+    let available_resources = advertised.snapshot();
     let res = serialize_framed(&ServerMessage::Advertise {
         available_resources: available_resources.clone(),
     })?;

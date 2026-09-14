@@ -254,12 +254,53 @@ A failed `revoke_lease` ioctl keeps the `Leased` state (id + fd preserved),
 so the reclaim is retried on the next path that touches the card — the state
 machine never throws away the one handle that can still reclaim the objects.
 
+## Input hot-plug — the reconciler
+
+fbdev and DRM cards are fixed by what the kernel exposes at boot; input devices
+are not. `resource_manager::hotplug` re-checks `/dev/input` every
+`RECONCILE_INTERVAL` (2 s) and makes the server match what it finds:
+
+| observed | action |
+| --- | --- |
+| a device node with no index entry | open it, register the fd, `AdvertisedResources::insert`, `engine.offer(resource, policy)` |
+| the node was re-created for the SAME device (same `/sys/class/input/eventN/device`) | replace the server's fd only: no revoke, no offer — the holder's dup still works, and the next grant gets a path that resolves |
+| a DIFFERENT device now owns the node | `engine.withdraw(old)`, close the old fd, then adopt the new device |
+| the node is absent, but its device still exists (udev mid-re-creation) | nothing — it is not a removal; the node is re-opened when it returns |
+| the node and its device are gone (unplug) | `engine.withdraw`, close the fd, drop the index entry |
+
+Details that matter:
+
+- **Two identities**: the inode (`dev, ino`, from `fstat` on the fd we opened,
+  re-checked against the path) says whether the node is still the one we opened;
+  the sysfs device (`/sys/class/input/eventN/device` resolved) says whether it is
+  still the same DEVICE. A udev trigger re-creates `eventN` for a device that
+  never moved — revoking a holder then would take working input away for nothing
+  — while an unplug changes both. Never revoke on the inode alone.
+- **Why the fd is replaced anyway**: a deleted inode resolves to
+  `eventN (deleted)`, and that is the string a client's libinput tries to open
+  on the next grant (the backend resolves the fd through `/proc/self/fd`). The
+  server's fd must therefore follow the node; the holders' dups need not.
+- **Index reuse**: an adopted device takes the lowest free index of its class, so
+  a replug lands on the name it had before instead of shifting every later device.
+- **Why polling, not a udev monitor**: the `input` feature pulls `evdev` with
+  `default-features = false` to keep libudev out of the build, and udev's node
+  setup is asynchronous anyway (a device that is not ready yet is simply retried
+  on the next pass). The cost is a handful of opens every 2 s.
+- **Withdrawal is a revoke**: `PolicyEngine::withdraw` marks the slot so no new
+  Acquire succeeds, drops its waiters, and tells the holder to leave on the usual
+  handshake (5 s deadline, then force-reclaim). The slot is removed once nobody
+  holds it, so a later `offer` of the same resource starts clean.
+- **Queued waiters are dropped, not answered**: the protocol has no async
+  "cancelled" reply, so a client already told `Queued` for a withdrawn resource
+  simply never hears back (its next Acquire is refused).
+
 ## What this design does not touch
 
 - **Wire protocol**: ungated, unchanged — `Advertise` lists what this build
   actually registered.
-- **Policy engine**: slots come from `advertised`; a backend that isn't
-  compiled is simply never a slot.
+- **Policy engine**: slots come from `advertised`, plus one `Offer` per resource
+  the input reconciler adopts at runtime; a backend that isn't compiled is
+  simply never a slot.
 - **Client crates**: `libsgc-rs` and the demo clients talk to the protocol
   crate only; they build identically against any server build.
 - **fbdev/input grants**: still plain dups of the server's registered fd;
