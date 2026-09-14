@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let engine = PolicyEngine::spawn(policies);
 
     // Input devices are not a boot-time snapshot: adopt the ones plugged in
-    // while the server runs, and withdraw the ones that go away. Resources
+    // while the server runs, and suspend the ones that go away. Resources
     // adopted later are offered to the engine with the same policy.
     #[cfg(feature = "input")]
     tokio::spawn(hotplug::run(

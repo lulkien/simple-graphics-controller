@@ -37,6 +37,22 @@ pub(super) async fn process_control_message(
             let resp = serialize_framed(&ServerMessage::Revoke { resource })?;
             stream.write_all(&resp).await.map_err(ServerError::Write)?;
         }
+        ControlMessage::Advertise {
+            available_resources,
+        } => {
+            // Server-level push: a device appeared or went away. The client
+            // replaces its list; no fd and no ack are involved. A client that
+            // predates this push reads it as an unexpected message and ignores
+            // it, which is why the same `Advertise` variant is reused instead of
+            // introducing a new one.
+            info!(
+                "[client {client_id} (pid {client_pid})] Pushing Advertise: {available_resources:?}"
+            );
+            let resp = serialize_framed(&ServerMessage::Advertise {
+                available_resources,
+            })?;
+            stream.write_all(&resp).await.map_err(ServerError::Write)?;
+        }
         ControlMessage::Grant { resource } => {
             // The engine granted this client the slot (from the queue or a
             // revoke-ack). Produce the fd and send the Grant. If the fd

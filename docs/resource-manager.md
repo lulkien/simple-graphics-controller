@@ -263,11 +263,13 @@ server match what it finds:
 
 | observed | action |
 | --- | --- |
-| a device node with no index entry | open it, register the fd, `AdvertisedResources::insert`, `engine.offer(resource, policy)` |
+| a device node with no index entry | open it, register the fd, `AdvertisedResources::insert`, `engine.offer(resource, policy)` — unless it is the device a SUSPENDED resource of the same class is waiting for, which it resumes instead |
 | the node was re-created for the SAME device (same `/sys/class/input/eventN/device`) | replace the server's fd only: no revoke, no offer — the holder's dup still works, and the next grant gets a path that resolves |
-| a DIFFERENT device now owns the node | `engine.withdraw(old)`, close the old fd, then adopt the new device |
+| a DIFFERENT device now owns the node, and the old device still exists | replace the server's fd only — the holder's dup still works |
+| a DIFFERENT device now owns the node and the old device is gone (replaced within one pass) | resume: the holder keeps the resource and is handed the new device's fd |
 | the node is absent, but its device still exists (udev mid-re-creation) | nothing — it is not a removal; the node is re-opened when it returns |
-| the node and its device are gone (unplug) | `engine.withdraw`, close the fd, drop the index entry |
+| the node and its device are gone (unplug) | `engine.suspend`: the resource leaves the advertised list and nothing else changes — its holder KEEPS it; the index entry stays, marked suspended |
+| the device of a suspended resource comes back (same node, or the same class on another node) | `engine.resume`: register the fresh fd, re-advertise, and re-grant the holder |
 
 Details that matter:
 
@@ -302,13 +304,36 @@ Details that matter:
   stale view has nothing else to correct it, so a pass runs every 60 s
   regardless. A node that is announced but not yet openable is retried after
   500 ms (up to 5 times) rather than waiting for the next tick.
-- **Withdrawal is a revoke**: `PolicyEngine::withdraw` marks the slot so no new
-  Acquire succeeds, drops its waiters, and tells the holder to leave on the usual
-  handshake (5 s deadline, then force-reclaim). The slot is removed once nobody
-  holds it, so a later `offer` of the same resource starts clean.
-- **Queued waiters are dropped, not answered**: the protocol has no async
-  "cancelled" reply, so a client already told `Queued` for a withdrawn resource
-  simply never hears back (its next Acquire is refused).
+- **Every change is pushed to the clients that are already connected**: the
+  engine broadcasts the new list (`ControlMessage::Advertise` →
+  `ServerMessage::Advertise`) — the whole list, not a delta, so a missed push
+  costs nothing and an old client that predates the push simply reads it as an
+  unexpected message. Adoption is offered to the engine BEFORE the push goes out,
+  so a client that acts on the list at once has its Acquire accepted.
+- **A device that goes away is SUSPENDED, never revoked**: unplugging a mouse
+  must not cost a running app its mouse, and it must not cost it a re-acquire
+  that a client with no display could win the race for. `PolicyEngine::suspend`
+  leaves the slot and its holder exactly as they are and only takes the resource
+  out of the advertised list (it cannot be granted while its device is away, and
+  a later Acquire is refused with "not available while its device is away").
+  Nothing is sent to the holder; its own fd dies, which is what libinput reports
+  to it as `DEVICE_REMOVED`.
+- **A device that comes back resumes the SAME resource**: the index entry that
+  was kept holds the resource name, so the returning device is matched to it —
+  by the node it had, or, if it returned on another node, by class (lowest
+  index) — the fresh fd is registered, the resource is re-advertised, and
+  `PolicyEngine::resume` sends the holder an unsolicited `Grant` for the
+  resource it never lost. Order matters: the fd is registered before the engine
+  is told, because the grant is a dup of that registry entry.
+- **The cost, stated plainly**: while a device is away its resource stays
+  reserved for the client that held it — nobody else can take it, and if the
+  device never comes back the name stays reserved for as long as that client
+  lives. That is the price of "a grant survives the hardware leaving" (the
+  alternative, revoking, is what forces an app to re-acquire and races with
+  other clients).
+- **A display the server loses is a different matter**: nothing withdraws a
+  resource any more, so the only ways a slot stops being the holder's are the
+  client's own Release, a policy preemption, and a disconnect.
 
 ## What this design does not touch
 
