@@ -1,10 +1,12 @@
 # Linkage convention: musl targets are fully static; gnu targets are
 # dynamically linked (the board runs glibc).
+#
+# No cross linker is named for the gnu target: the Justfile builds that triple
+# with cargo-zigbuild, which brings its own libc and linker. The
+# aarch64-unknown-linux-gnu-gcc this file used to name is not installed on
+# Debian (only binutils is), so that line was a build failure waiting to happen.
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-unknown-linux-musl-gcc"
-
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-unknown-linux-gnu-gcc"
