@@ -1,0 +1,52 @@
+#!/sbin/openrc-run
+# OpenRC service for the @sgc resource daemon on Alpine.
+#
+# The counterpart of packaging/simple-graphics-controller.service. Same
+# decisions, expressed in OpenRC's vocabulary:
+#
+#   - runs as root, because it opens /dev/dri and /dev/input directly (no
+#     libseat) and has to take DRM master;
+#   - restarts on crash, at the unit's rate: Restart=always + RestartSec=5 with
+#     StartLimitBurst=12 over 60s becomes supervise-daemon with respawn_delay=5
+#     and respawn_max=12 per respawn_period=60. A crash leaves clients without a
+#     screen, so dying quietly is worse than restarting; a device that is not
+#     ready yet deserves about a minute of retries before a real crash loop
+#     stops and logs instead of spinning;
+#   - raises the file-descriptor limit, because leases are handed to clients as
+#     fds (LimitNOFILE=4096 in the unit);
+#   - is ordered after the device nodes exist: `after devfs mdev` is the OpenRC
+#     equivalent of the unit's ordering against dev-dri-card0.device, without
+#     which a boot-time start races the device nodes, fails to take DRM master,
+#     and burns through the restart allowance.
+#
+# Settings come from /etc/conf.d/simple-graphics-controller, which OpenRC
+# sources before this script; RUST_LOG and SGC_POLICY default here.
+#
+# A client is sgc-or-die, so a client's own service wants:
+#
+#   depend() { need simple-graphics-controller; }
+#
+# with `provides = sgc-controller` below available as the stable dependency name.
+
+: "${RUST_LOG:=info}"
+# first-owner | latest-owner | fair-queue (the daemon's default)
+: "${SGC_POLICY:=fair-queue}"
+export RUST_LOG SGC_POLICY
+
+description="simple-graphics-controller (@sgc) - DRM/fbdev/input resource broker"
+command="/usr/bin/simple-graphics-controller"
+command_user="root:root"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=12
+respawn_period=60
+
+# leases pass fds to clients over the abstract @sgc socket; leave headroom
+rc_ulimit="-n 4096"
+
+depend() {
+	need localmount
+	after modules devfs mdev
+	use logger
+	provide sgc-controller
+}

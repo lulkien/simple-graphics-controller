@@ -61,10 +61,11 @@ The `@sgc` daemon: resource manager for the board's graphics + input devices (ru
 ```sh
 just                          # release build (drm + input), or:
 cargo build --release         # same
-just build-gnu-aarch64        # board: gnu dynamic
+just build-gnu-aarch64        # board: gnu dynamic (cargo-zigbuild links it)
 just build-musl-aarch64       # board: fully static musl
-just dist-gnu-aarch64         # + strip into ./dist (build output, gitignored)
+just dist-musl-aarch64        # + strip into ./dist (build output, gitignored)
 just packages                 # all four installable .debs into target/debian/
+just package-apk-aarch64      # installable .apk (+ OpenRC) into dist/apk/aarch64/
 just ci                       # the gate: fmt + clippy + tests + packages
 
 Run as **root** (it opens `/dev/dri` + `/dev/input`):
@@ -75,6 +76,12 @@ Features:
 - `--features fbdev` — enable legacy fbdev path
 - `SGC_POLICY=first-owner|latest-owner|fair-queue` — env var overrides default fair-queue
 ```
+
+The named recipes are shortcuts: `just build-target <triple>`,
+`just dist-target <triple>`, `just package-deb <triple> <variant>` and
+`just package-apk <arch>` carry the actual work, so adding a target does not mean
+another recipe. The strip tool and the cross linker are derived from the triple
+(see `docs/packaging.md`).
 
 ## Packaging & CI
 `just ci` is the gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then every package flavor. It is just recipes on purpose (no GitHub Actions workflow), so the same command runs on a workstation and on any runner.
@@ -90,7 +97,11 @@ Four `.deb` flavors, all built by `just packages` into `target/debian/`:
 
 Each installs `/usr/bin/simple-graphics-controller` and `/lib/systemd/system/simple-graphics-controller.service`; `debian/postinst` reloads the unit, enables it at boot and starts it, `debian/prerm` stops and disables it.
 
+The Alpine counterpart is `just package-apk-aarch64` (or `-x86_64`): the same static musl binary plus `packaging/openrc/simple-graphics-controller`, into `dist/apk/<arch>/`, signed with a key kept in `dist/apk-keys/`. abuild runs natively where it exists or in an alpine container, and stays out of `just packages`/`just ci` so docker is not a gate prerequisite.
+
 Rules that bite:
+
+- Toolchains: musl targets link with the musl.cc toolchain named in `.cargo/config.toml`; the gnu cross target links with `cargo-zigbuild`, which brings its own libc. No cross gcc is installed on the workstation, and the strip tool is derived from the triple rather than listed per target.
 
 - `dist/` is gitignored build output; package sources live in `packaging/` (unit, board drop-in) and the install notes in `docs/packaging.md`. A unit kept in `dist/` breaks a fresh clone: cargo-deb needs every asset file to exist.
 - cargo-deb names its output `<name>_<version>_<arch>.deb` whatever `--variant` says, and it rewrites `target/debian` when it packages. Two flavors for one architecture therefore need distinct package names; renaming after the fact loses a race with the next flavor's build.
