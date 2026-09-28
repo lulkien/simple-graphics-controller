@@ -21,14 +21,21 @@ pub mod hotplug;
 #[cfg(feature = "input")]
 mod input;
 
+// Both are only used by the debug/test-only consistency checker below: a release
+// build does not compile it, and then has no use for them.
+#[cfg(all(feature = "input", any(test, debug_assertions)))]
 use std::collections::HashMap;
+#[cfg(all(feature = "input", any(test, debug_assertions)))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use simple_graphics_protocol::Resource;
 
-use crate::types::{AdvertisedResources, ResourceRegistry};
+use crate::types::ResourceRegistry;
+// as above: only the consistency checker (and its tests) name this type
+#[cfg(any(test, debug_assertions))]
+use crate::types::AdvertisedResources;
 
 use std::os::fd::OwnedFd;
 
@@ -173,7 +180,12 @@ pub fn open_resources() -> (Inventory, Vec<Resource>) {
 ///    the name, the daemon keeps no way to hand it out;
 /// 4. every advertised input has an index entry, and every input fd belongs to
 ///    an advertised resource (never a grant source without a device behind it).
-#[cfg(feature = "input")]
+///
+/// Built for the two callers that exist: the `debug_assertions` check hotplug
+/// runs after suspend/adopt, and the tests below. A release build has neither,
+/// which is why the gate is not just the `input` feature - it was dead code
+/// there, and warned about it.
+#[cfg(all(feature = "input", any(test, debug_assertions)))]
 pub fn check_consistency(
     fds: &ResourceRegistry,
     index: &InputIndex,
